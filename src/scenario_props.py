@@ -37,7 +37,7 @@ def scenario_prop():
         'n_subcarriers': 1024
     },
     'city_6_miami': {
-        'n_rows': 1, #199
+        'n_rows': 199,
         'n_per_row': 216 ,
         'n_ant_bs': 16,
         'n_subcarriers': 32
