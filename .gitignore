@@ -206,8 +206,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Scenarios
+# Scenarios and LWM
 scenarios/
 src/LWM/
 src/LWM-v1.1/
 src/LWM_v1_1/
+
+# Data
+data/

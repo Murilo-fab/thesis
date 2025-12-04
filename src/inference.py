@@ -27,7 +27,7 @@ def lwm_inference(
         The resulting tensor from the inference process.
     """
     if input_type == "raw":
-        return data
+        return torch.tensor(data).float()
 
     if model is None:
         raise ValueError("A model must be provided for inference when input_type is not 'raw'.")

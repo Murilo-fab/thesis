@@ -1,139 +1,284 @@
+import torch
 import numpy as np
 
-def mmse_precoder(H, P_tot, sigma2):
-    M, K = H.shape
+EPS = 1e-12
+
+def zf_precoder(H, P_max, sigma2=1.0):
+    """
+    Calculates Zero-Forcing Beamforming and Sum Rate.
     
-    alpha = K*sigma2/P_tot
-    # A = H H^H + alpha I_M
-    A = H @ H.conj().T + alpha * np.eye(M)
-    # U = A^-1 H
-    U = np.linalg.solve(A, H)
-    # Normatization
-    tr = np.trace(U @ U.conj().T)
-    beta = np.sqrt(P_tot/tr)
-    W = beta*U
+    Args:
+        H: Channel (N, K, M)
+        P_max: Total power constraint (scalar)
+        sigma2: Noise variance (scalar)
+        
+    Returns:
+        V: Precoding matrix (N, M, K)
+        sum_rate: Achieved sum rate (scalar)
+    """
+    N, K, M = H.shape
+
+    # Sanity check: ZF requires at least as many antennas as users
+    if M < K:
+        raise ValueError(f"Zero-Forcing requires M >= K. Got M={M}, K={K}.")
+
+    # 1. Calculate Moore-Penrose Pseudo-inverse
+    # H is (N, K, M) -> pinv(H) is (N, M, K)
+    V_raw = np.linalg.pinv(H)
+
+    # 2. Power Normalization (Total Power Constraint)
+    # We simply scale the raw ZF matrix so the total power equals P_max
+    current_total_power = np.sum(np.abs(V_raw)**2)
+    
+    # Scaling factor alpha
+    alpha = np.sqrt(P_max / current_total_power)
+    
+    V = V_raw * alpha
+
+    # 3. Calculate Sum Rate
+    # We calculate the exact SINR to account for numerical residuals
+    
+    # Effective Channel: (N, K, M) @ (N, M, K) -> (N, K, K)
+    # Ideally, this is a diagonal matrix (Interference is 0)
+    HV = H @ V 
+    
+    # Signal Power: Magnitude squared of diagonal elements
+    signal_power = np.abs(np.einsum('nkk->nk', HV))**2
+    
+    # Interference: Sum of squares of off-diagonals
+    # Total power received per user - Signal Power
+    total_rx_power = np.sum(np.abs(HV)**2, axis=2)
+    interference_power = total_rx_power - signal_power
+    
+    # Note: For ZF, interference_power should be ~1e-30 (machine epsilon)
+    # But we include it for mathematical correctness
+    sinr = signal_power / (interference_power + sigma2)
+    
+    sum_rate = np.sum(np.log2(1 + sinr))
+
+    return V, sum_rate
+
+def update_u(H, V, sigma2=1.0):
+    """
+    Computes MMSE receiver scalar U for all N subcarriers simultaneously.
+    H: (N, K, M)
+    V: (N, M, K)
+    """
+    # 1. Batch Matrix Multiplication
+    # (N, K, M) @ (N, M, K) -> (N, K, K)
+    # Contains signal (diagonal) and interference (off-diagonal) for all N
+    HV = H @ V 
+
+    # 2. Calculate Total Received Power (Denominator)
+    # We sum across axis 2 (the streams j) for each user k (axis 1)
+    # Shape: (N, K, K) -> (N, K)
+    total_power = np.sum(np.abs(HV)**2, axis=2) + sigma2
+
+    # 3. Extract Desired Signal (Numerator)
+    # We need the diagonal elements of the last two dimensions
+    # einsum 'nkk->nk' grabs the diagonal k,k for every batch n
+    effective_gain = np.einsum('nkk->nk', HV)
+
+    # 4. MMSE Update
+    U = np.conjugate(effective_gain) / total_power
+
+    return U
+
+def update_w(H, V, U):
+    """
+    H: (N, K, M) - Channels
+    V: (N, M, K) - Precoders
+    U: (N, K)    - Receiver scalars
+    """
+    # 1. Efficiently compute ONLY the diagonal elements of H @ V
+    # We want to sum over dimension M for matching users K
+    # Einstein Summation: 
+    # n: batch (subcarriers)
+    # k: user index (row in H)
+    # m: antenna index (contraction dim)
+    # k: user index (col in V, corresponds to user k's stream)
+    # -> nk: output is (N, K) scalar signals
+    
+    signal_gain = np.einsum('nkm,nmk->nk', H, V) # Returns complex (N, K)
+
+    # 2. Calculate MSE (1 - u * h * v)
+    # Note: U is usually conjugated in the formula, but in code U is often 
+    # already stored as the conjugate value from the update_u step. 
+    # Assuming your U input is already the correct conjugate factor:
+    mse_term = 1.0 - np.real(U * signal_gain)
+
+    # 3. Compute W with stability protection
+    # Clip minimum MSE to 1e-6 to prevent division by zero/huge weights
+    W = 1.0 / np.maximum(mse_term, 1e-6)
 
     return W
 
-def beamforming(W):
-    # W: (M, K) precoder MMSE já calculado
-    M, K = W.shape
-
-    # Inicializa arrays
-    F = np.zeros_like(W, dtype=np.complex128)  # direções unitárias
-    p_init = np.zeros(K)                        # potências iniciais
-
-    for k in range(K):
-        norm_wk = np.linalg.norm(W[:, k])
-        if norm_wk > 0:
-            F[:, k] = W[:, k] / norm_wk
-            p_init[k] = norm_wk**2
-        else:
-            F[:, k] = np.zeros(M)  # caso w_k = 0
-            p_init[k] = 0.0
+def update_v(H, U, W, P_total):
+    """
+    Optimizes V for all subcarriers under a GLOBAL Total Power Constraint.
+    N: Subcarriers, K: Users, M: Antennas
+    """
+    N, K, M = H.shape
     
-    return F
+    # --- 1. Construct A and B matrices for all subcarriers (Vectorized) ---
+    # We want to build A_n and B_n simultaneously for all n=0..N-1
+    
+    # Weights: (N, K)
+    weights = W * np.abs(U)**2
+    
+    # Reshape H for broadcasting: (N, K, M, 1)
+    H_r = H.reshape(N, K, M, 1)
+    
+    # Calculate outer products h_k^H * h_k: (N, K, M, M)
+    # (N, K, M, 1) @ (N, K, 1, M) -> (N, K, M, M)
+    HH = np.matmul(H_r.conj(), H_r.transpose(0, 1, 3, 2))
+    
+    # A: Weighted sum of outer products over K users -> (N, M, M)
+    # Sum(weights * HH)
+    A = np.sum(weights[:, :, None, None] * HH, axis=1)
 
-def power_allocation():
-    pass
+    # B: Term w_k * u_k^* * h_k^H -> (N, M, K)
+    # We need B[:, :, k] to be the vector for user k
+    # w*u_conj: (N, K) -> broadcast
+    # H_hermitian: (N, K, 1, M) -> transpose to get h^H
+    factors = (W * np.conj(U))[:, :, None, None] # (N, K, 1, 1)
+    H_herm = H_r.transpose(0, 1, 3, 2).conj()    # (N, K, 1, M)
+    B_raw = factors * H_herm                      # (N, K, 1, M)
+    B = B_raw.squeeze(2).transpose(0, 2, 1)       # (N, M, K)
 
-def power_allocation_wmmse_fixed_dirs(H, F, P_tot, sigma2,
-                                      max_iter=200, tol=1e-6, eps=1e-12):
-    """
-    Optimiza potências p_k >=0 com direções fixas F (colunas unit-norm)
-    para maximizar soma de taxas aproximada pelo algoritmo WMMSE.
-    Entradas:
-      H: (M, K) canais, col k = h_k (complex)
-      F: (M, K) direções normalizadas, col k = f_k (complex), ||f_k||=1
-      P_tot: potência total disponível (float)
-      sigma2: ruído (float)
-      max_iter, tol: controle de iteração
-    Retorna:
-      p: vetor de potências ótimas (K,)
-      rates: soma das taxas ao final (bits/s/Hz)
-      history: dict com histórico de soma-rate por iteração
-    """
-    M, K = H.shape
-    # pré-calcula os ganhos escalares g_kj = h_k^H f_j -> matriz KxK
-    G = np.zeros((K, K), dtype=np.complex128)
-    for k in range(K):
-        G[k, :] = H[:, k].conj().T @ F  # row k contains g_kj for j=1..K
+    # --- 2. The EVD Trick (Crucial for Performance) ---
+    # Since A is Hermitian, diagonalize it: A = Q * Lambda * Q^H
+    # This is done ONCE per update_v call, outside the bisection loop.
+    lambdas, Q = np.linalg.eigh(A) # lambdas: (N, M), Q: (N, M, M)
 
-    p = np.ones(K) * (P_tot / K)
+    # Transform B into the eigenspace: B_tilde = Q^H * B
+    # (N, M, M).conj().T is tricky in numpy, use explicit transpose swap
+    Q_H = Q.transpose(0, 2, 1).conj()
+    B_tilde = np.matmul(Q_H, B) # (N, M, K)
 
-    history = {'sumrate': []}
+    # --- 3. Global Bisection Search for mu ---
+    # We look for one mu such that Sum_N(Power_n(mu)) == P_total
+    
+    def calc_total_power(mu):
+        # The inverse of (Lambda + mu*I) is just 1/(lambda + mu)
+        # We apply this diagonal scaling to B_tilde
+        # Denominator: (N, M, 1) to broadcast over K streams
+        inv_diag = 1.0 / (lambdas + mu)[:, :, None] 
+        
+        # V_tilde = (Lambda + mu*I)^-1 * B_tilde
+        V_tilde = inv_diag * B_tilde 
+        
+        # Power is invariant under unitary transformation Q, 
+        # so sum(|V|^2) == sum(|V_tilde|^2). We don't need to rotate back yet!
+        return np.sum(np.abs(V_tilde)**2)
 
-    for it in range(max_iter):
-        # 1) compute interference+noise for each user
-        int_plus_noise = (np.abs(G)**2) @ p + sigma2  # shape (K,)
-        # 2) compute u_k (scalar MMSE receive)
-        # note: sqrt(p_k) * g_kk is complex; u_k is complex
-        u = (np.sqrt(p) * np.diag(G).conj()) / int_plus_noise
-        # 3) compute MSE_k
-        # term1 = 1
-        # term2 = -2 Re{u_k^* sqrt(p_k) g_kk}
-        # term3 = |u_k|^2 * (sum_j p_j |g_kj|^2 + sigma2)
-        term2 = -2.0 * np.real(u.conj() * (np.sqrt(p) * np.diag(G)))
-        term3 = (np.abs(u)**2) * int_plus_noise
-        MSE = 1.0 + term2 + term3
-        # avoid division by zero
-        MSE = np.maximum(MSE, eps)
-        # 4) weights
-        w = 1.0 / MSE  # shape (K,)
+    # Check unconstrained power (mu=0)
+    if calc_total_power(0.0) <= P_total:
+        opt_mu = 0.0
+    else:
+        # Find mu such that power == P_total
+        low, high = 0.0, 1e5 # Adjust upper bound if needed
+        for _ in range(20): # 20 iters is usually enough for float32 precision
+            mid = (low + high) / 2
+            p_val = calc_total_power(mid)
+            if p_val > P_total:
+                low = mid
+            else:
+                high = mid
+        opt_mu = high
 
-        # 5) compute c_j and d_j
-        # c_j = sum_k w_k |u_k|^2 |g_kj|^2   -> shape (K,)
-        # d_j = w_j * Re{u_j^* g_jj}
-        absG2 = np.abs(G)**2  # KxK
-        c = (w * (np.abs(u)**2)) @ absG2  # shape (K,)
-        d = w * np.real(u.conj() * np.diag(G))  # shape (K,)
-        # force nonnegative d
-        d = np.maximum(d, 0.0)
+    # --- 4. Reconstruct Final V ---
+    # Apply optimal mu, rotate back with Q
+    inv_diag_opt = 1.0 / (lambdas + opt_mu)[:, :, None]
+    V_tilde_opt = inv_diag_opt * B_tilde
+    V = np.matmul(Q, V_tilde_opt) # (N, M, K)
 
-        # 6) find lambda >=0 s.t. sum_j (d_j/(c_j+lambda))^2 = P_tot
-        # if c_j negative numerical (shouldn't), clip to >=0
-        c = np.maximum(c, 0.0)
-        # closed form if lambda = 0 satisfies power
-        def compute_power_sum(lmbda):
-            t = d / (c + lmbda)
-            return np.sum(t**2)
+    return V
 
-        # check if lambda=0 satisfies constraint
-        if compute_power_sum(0.0) <= P_tot:
-            lam = 0.0
-        else:
-            # bissecção para lambda
-            lam_lo = 0.0
-            lam_hi = 1.0
-            # find hi such that power_sum(hi) < P_tot
-            while compute_power_sum(lam_hi) > P_tot:
-                lam_hi *= 2.0
-                if lam_hi > 1e12:
-                    break
-            # bissecção
-            for _ in range(60):
-                lam_mid = 0.5 * (lam_lo + lam_hi)
-                if compute_power_sum(lam_mid) > P_tot:
-                    lam_lo = lam_mid
-                else:
-                    lam_hi = lam_mid
-            lam = 0.5*(lam_lo + lam_hi)
+def wmmse(H, P_max, sigma2=1.0):
+    N, K, M = H.shape
+    
+    # --- 1. Initialization with Power Normalization ---
+    V, _ = zf_precoder(H, P_max, sigma2)
+    
+    # Calculate current random power
+    # (Assuming Total Power Constraint over all N subcarriers)
+    current_power = np.sum(np.abs(V)**2)
+    
+    # Scale V to exactly match P_max initially
+    V = V * np.sqrt(P_max / current_power)
 
-        t = d / (c + lam)
-        p_new = t**2
-        # project tiny negatives to zero (numerical)
-        p_new = np.maximum(p_new, 0.0)
-
-        # compute sum-rate for monitoring
-        sinr = (p_new * np.abs(np.diag(G))**2) / ( (np.abs(G)**2) @ p_new - p_new * np.abs(np.diag(G))**2 + sigma2 )
-        rates = np.log2(1.0 + np.maximum(sinr, 0.0))
-        sumrate = np.sum(rates)
-        history['sumrate'].append(sumrate)
-
-        # stop criterion
-        if np.linalg.norm(p_new - p) / (np.linalg.norm(p) + 1e-12) < tol:
-            p = p_new
+    sum_rate = 0.0
+    
+    # --- 2. Optimization Loop ---
+    for i in range(200):
+        # Update order: U -> W -> V
+        U = update_u(H, V, sigma2)
+        W = update_w(H, V, U)
+        # Ensure you use the Corrected/Vectorized update_v from previous advice
+        V = update_v(H, U, W, P_max) 
+        
+        # Convergence check using the W-proxy (computationaly cheap)
+        # We take abs(W) just to be safe, though W should be real positive
+        current_sum_rate_proxy = np.sum(np.log2(np.abs(W)))
+        
+        if abs(sum_rate - current_sum_rate_proxy) < 1e-4:
             break
-        p = p_new
+            
+        sum_rate = current_sum_rate_proxy
 
-    return p, sumrate, history
+    # --- 3. Final Accurate Rate Calculation ---
+    # Recalculate exact SINR one last time to ensure the returned rate is real physics
+    # (Re-using code logic for SINR calculation)
+    HV = H @ V
+    signal_power = np.abs(np.einsum('nkk->nk', HV))**2
+    inter_plus_noise = np.sum(np.abs(HV)**2, axis=2) - signal_power + sigma2
+    sinr = signal_power / inter_plus_noise
+    final_exact_rate = np.sum(np.log2(1 + sinr))
+
+    return V, final_exact_rate
+
+def sum_rate_loss(power_alloc, channel_matrix, noise_var=1.0):
+    """
+    Calculates Sum Rate considering Inter-User Interference (SINR).
+    Assumption: BS uses MRT Phases + AI-Predicted Amplitudes.
+    
+    Args:
+        power_alloc: [Batch, S, K, N] (Power magnitudes per antenna)
+        channel_matrix: [Batch, S, K, N, 2] (Raw channel Real/Imag)
+    """
+    epsilon = 1e-9
+
+    # 1. Convert Raw Channel to Complex Tensor [Batch, S, K_rx, N_ant]
+    h_complex = torch.view_as_complex(channel_matrix)
+    
+    # 2. Construct the Beamformer (Precoder) Vectors
+    # MRT Phase (Conjugate Beamforming) + AI Amplitude
+    w_mag = torch.sqrt(power_alloc + epsilon)
+    w_phase = -h_complex.angle()
+    w_complex = w_mag * torch.exp(1j * w_phase)
+
+    # 3. Compute Received Signal Matrix (Interference Map)
+    # Interaction G_ij = h_i . w_j
+    # Einsum: b=batch, s=subcarrier, i=Rx User, j=Tx User, n=Antenna
+    interaction_matrix = torch.einsum('bsin,bsjn->bsij', h_complex, w_complex)
+    
+    # 4. Compute Power Received
+    power_received_matrix = (interaction_matrix.abs()) ** 2
+    
+    # 5. Extract Signal and Interference
+    # Diagonal (i==j) is Signal
+    signal_power = torch.diagonal(power_received_matrix, dim1=-2, dim2=-1) 
+    # Sum over Tx users (j) is Total Power
+    total_power_received = torch.sum(power_received_matrix, dim=-1)        
+    # Interference = Total - Signal
+    interference_power = total_power_received - signal_power
+    
+    # 6. SINR Calculation
+    sinr = signal_power / (interference_power + noise_var + epsilon)
+    
+    # 7. Rate Calculation (Shannon)
+    rate_per_subcarrier = torch.log2(1 + sinr)
+    total_sum_rate = torch.sum(rate_per_subcarrier, dim=(1, 2))
+    
+    return -torch.mean(total_sum_rate)

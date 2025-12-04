@@ -1,70 +1,21 @@
 from scenario_props import *
 import numpy as np
 import DeepMIMOv3
-from collections import defaultdict
 import torch
 from tqdm import tqdm
-from inference import lwm_inference
-from power_allocation import power_allocation
 
 import warnings
 warnings.filterwarnings('ignore')
 
-def get_parameters(scenario, bs_idx=1):
-    # For default, the model currently uses only one antenna for the UE
-    n_ant_ue = 1
-    scs = 30e3
-    # Retrieves default scenario properties
-    row_column_users = scenario_prop()
-    # Selected scenario and folder
-    parameters = DeepMIMOv3.default_params()
-    parameters['dataset_folder'] = './scenarios'
-    parameters['scenario'] = scenario.split("_v")[0]
+# --- Configuration Constants ---
+DEFAULT_NUM_UE_ANTENNAS = 1
+DEFAULT_SUBCARRIER_SPACING = 30e3  # Hz
+DEFAULT_BS_ROTATION = np.array([0, 0, -135])  # (x, y, z) degrees
+DEFAULT_NUM_PATHS = 20
+DATASET_FOLDER = './scenarios'
 
-    n_ant_bs = row_column_users[scenario]['n_ant_bs']
-    n_subcarriers = row_column_users[scenario]['n_subcarriers']
-    parameters['active_BS'] = np.array([bs_idx])
-    
-    if isinstance(row_column_users[scenario]['n_rows'], int):
-        parameters['user_rows'] = np.arange(row_column_users[scenario]['n_rows'])
-    else:
-        parameters['user_rows'] = np.arange(row_column_users[scenario]['n_rows'][0],
-                                            row_column_users[scenario]['n_rows'][1])
-
-    parameters['bs_antenna']['shape'] = np.array([n_ant_bs, 1]) # Horizontal, Vertical 
-    parameters['bs_antenna']['rotation'] = np.array([0,0,-135]) # (x,y,z)
-    parameters['ue_antenna']['shape'] = np.array([n_ant_ue, 1])
-    parameters['enable_BS2BS'] = False
-    parameters['OFDM']['subcarriers'] = n_subcarriers
-    parameters['OFDM']['selected_subcarriers'] = np.arange(n_subcarriers)
-    
-    parameters['OFDM']['bandwidth'] = scs * n_subcarriers / 1e9
-    parameters['num_paths'] = 20
-
-    return parameters
-
-def deepmimo_data_cleaning(deepmimo_data):
-    # Remove users without a path between the TX and RX
-    idxs = np.where(deepmimo_data['user']['LoS'] != -1)[0]
-    cleaned_deepmimo_data = deepmimo_data['user']['channel'][idxs]
-    return np.array(cleaned_deepmimo_data) * 1e6
-
-def deepmimo_data_gen(scenario_names=None, bs_idxs=[1,2,3]):
-    deepmimo_data = []
-    # For each BS, generates the data
-    for scenario_name in scenario_names:
-        for bs_idx in bs_idxs:
-            parameters = get_parameters(scenario_name, bs_idx)
-            deepMIMO_dataset = DeepMIMOv3.generate_data(parameters)[0]
-        
-            deepmimo_data.append(deepMIMO_dataset)
-        # Those properties will be useful during the sampling
-    return deepmimo_data
-
-def sample_users(dataset, N):
-    # Selectes N random users
-    idxs = np.random.randint(0, len(dataset), N)
-    return dataset[idxs]
+# Define a constant for the scaling factor
+CHANNEL_SCALING_FACTOR = 1e6
 
 def patch_maker(original_ch, patch_rows, patch_cols):
     n_samples, _, n_rows, n_cols = original_ch.shape
@@ -134,110 +85,164 @@ def tokenizer(patches):
     
     return normalized_grouped_data
 
-def sample(deepmimo_data, N_samples, n_bs_antenna, Ptot=1, sigma2=10e-3):
-    channels = []
-    labels = np.zeros((N_samples, n_bs_antenna), dtype=float)
+def get_parameters(scenario: str, bs_idx: int = 1) -> dict:
+    """Constructs the parameter dictionary for DeepMIMOv3 data generation.
 
-    for i in tqdm(range(N_samples), desc="Sampling"):
-        scenario_idx = np.random.randint(0, len(deepmimo_data))
-        ue_idxs = np.random.randint(0, len(deepmimo_data[scenario_idx]), n_bs_antenna)
+    Args:
+        scenario: The name of the scenario (e.g., 'city_6_miami_v1').
+        bs_idx: The index of the active base station.
 
-        users = deepmimo_data[scenario_idx][ue_idxs]
-
-        V_wmmse, p_alloc = power_allocation(users, Ptot, sigma2)
-
-        channels.append(users)
-
-        labels[i, :] = p_alloc
-
-    return channels, labels
-
-def generate_dataset(model=None, input_types=["cls_emb"], device="cpu", batch_size=32, scenario_names=None, bs_idxs=[1,2,3], N_samples=1000, n_bs_antenna=8, n_rows=4, n_columns=4):
-    # Generate data with DeepMIMO for the selected scenario with active BS
-    deepmimo_data = deepmimo_data_gen(scenario_names, bs_idxs)
-    # Clean the data to exclude users without a path between TX and RX 
-    cleaned_deepmimo_data = [deepmimo_data_cleaning(deepmimo_data[scenario_idx]) for scenario_idx in range(len(deepmimo_data))]
-    # Choose users
-    selected_channels, labels = sample(cleaned_deepmimo_data, N_samples, n_bs_antenna)
-    outputs = {}
-    for input_type in input_types:
-        embeddings = []
-        for channels in tqdm(selected_channels, desc=f"Inference - {input_type}"):
-            # Create patches
-            patch_list = patch_maker(channels, n_rows, n_columns)
-            # Create tokens
-            tokens = tokenizer(patch_list)
-            # Perform embedding
-            embeddings.append(lwm_inference(model, tokens, input_type, device, batch_size))
-        embeddings = torch.stack(embeddings)
-        outputs[input_type] = embeddings
-    return torch.from_numpy(np.stack(selected_channels)).float(), outputs, torch.from_numpy(labels).float()
-
-
-import warnings
-warnings.filterwarnings('ignore')
-
-def get_parameters(scenario, bs_idx=1):
-    # For default, the model currently uses only one antenna for the UE
-    n_ant_ue = 1
-    scs = 30e3
-    # Retrieves default scenario properties
-    row_column_users = scenario_prop()
-    # Selected scenario and folder
-    parameters = DeepMIMOv3.default_params()
-    parameters['dataset_folder'] = './scenarios'
-    parameters['scenario'] = scenario.split("_v")[0]
-
-    n_ant_bs = row_column_users[scenario]['n_ant_bs']
-    n_subcarriers = row_column_users[scenario]['n_subcarriers']
-    parameters['active_BS'] = np.array([bs_idx])
+    Returns:
+        A dictionary of parameters compatible with DeepMIMOv3.generate_data.
+    """
+    # Retrieves scenario-specific properties (e.g., antenna counts)
+    scenario_configs = scenario_prop()
     
-    if isinstance(row_column_users[scenario]['n_rows'], int):
-        parameters['user_rows'] = np.arange(row_column_users[scenario]['n_rows'])
-    else:
-        parameters['user_rows'] = np.arange(row_column_users[scenario]['n_rows'][0],
-                                            row_column_users[scenario]['n_rows'][1])
+    # Start with default DeepMIMO parameters
+    parameters = DeepMIMOv3.default_params()
 
-    parameters['bs_antenna']['shape'] = np.array([n_ant_bs, 1]) # Horizontal, Vertical 
-    parameters['bs_antenna']['rotation'] = np.array([0,0,-135]) # (x,y,z)
-    parameters['ue_antenna']['shape'] = np.array([n_ant_ue, 1])
+    # --- Base Configuration ---
+    parameters['dataset_folder'] = DATASET_FOLDER
+    # Assumes scenario format is 'name_vX' and extracts the base name
+    parameters['scenario'] = scenario.split("_v")[0]
+    parameters['active_BS'] = np.array([bs_idx])
     parameters['enable_BS2BS'] = False
+    parameters['num_paths'] = DEFAULT_NUM_PATHS
+
+    # --- Scenario-Specific Configuration ---
+    n_ant_bs = scenario_configs[scenario]['n_ant_bs']
+    n_subcarriers = scenario_configs[scenario]['n_subcarriers']
+    user_rows_config = scenario_configs[scenario]['n_rows']
+
+    if isinstance(user_rows_config, int):
+        parameters['user_rows'] = np.arange(user_rows_config)
+    else: # Assumes a tuple or list [start, end]
+        parameters['user_rows'] = np.arange(user_rows_config[0], user_rows_config[1])
+
+    # --- Antenna and OFDM Configuration ---
+    parameters['bs_antenna']['shape'] = np.array([n_ant_bs, 1])  # [Horizontal, Vertical]
+    parameters['bs_antenna']['rotation'] = DEFAULT_BS_ROTATION
+    parameters['ue_antenna']['shape'] = np.array([DEFAULT_NUM_UE_ANTENNAS, 1])
     parameters['OFDM']['subcarriers'] = n_subcarriers
     parameters['OFDM']['selected_subcarriers'] = np.arange(n_subcarriers)
-    
-    parameters['OFDM']['bandwidth'] = scs * n_subcarriers / 1e9
-    parameters['num_paths'] = 20
+    parameters['OFDM']['bandwidth'] = (DEFAULT_SUBCARRIER_SPACING * n_subcarriers) / 1e9  # GHz
 
     return parameters
 
 def deepmimo_data_cleaning(deepmimo_data):
-    # Remove users without a path between the TX and RX
-    idxs = np.where(deepmimo_data['user']['LoS'] != -1)[0]
-    cleaned_deepmimo_data = deepmimo_data['user']['channel'][idxs]
-    return np.array(cleaned_deepmimo_data) * 1e6
+    """Cleans DeepMIMO data by removing users without a LoS path and scales channel coefficients.
 
-def deepmimo_data_gen(scenario_names=None, bs_idxs=[1,2,3]):
+    Args:
+        deepmimo_data (dict): The raw data dictionary returned by DeepMIMOv3.generate_data.
+
+    Returns:
+        np.ndarray: Cleaned and scaled channel data for users with a valid path.
+                    The channel coefficients are multiplied by CHANNEL_SCALING_FACTOR
+                    for numerical stability in subsequent processing (e.g., ML models).
+    """
+    # Identify users with a Line-of-Sight (LoS) path (LoS != -1 indicates a valid path)
+    valid_user_indices = np.where(deepmimo_data['user']['LoS'] != -1)[0]
+
+    # Select channel data only for valid users
+    cleaned_channels = deepmimo_data['user']['channel'][valid_user_indices]
+
+    # Scale the channel coefficients for numerical stability
+    return cleaned_channels * CHANNEL_SCALING_FACTOR
+
+def deepmimo_data_gen(scenario_names: list[str], bs_idxs: list[int] | None = None) -> list[dict]:
+    """Generates DeepMIMO channel data for multiple scenarios and base stations.
+
+    Args:
+        scenario_names: A list of scenario name strings to generate data for.
+        bs_idxs: A list of base station indices to use for each scenario.
+                 Defaults to [1, 2, 3] if not provided.
+
+    Returns:
+        A list of dictionaries, where each dictionary contains the 'scenario'
+        identifier and the corresponding 'channels' data (np.ndarray).
+    """
+    if bs_idxs is None:
+        bs_idxs = [1, 2, 3]
+
     deepmimo_data = []
-    # For each BS, generates the data
-    for scenario_name in scenario_names:
-        for bs_idx in bs_idxs:
-            parameters = get_parameters(scenario_name, bs_idx)
-            deepMIMO_dataset = DeepMIMOv3.generate_data(parameters)[0]
-            cleaned_deepmimo_data = deepmimo_data_cleaning(deepMIMO_dataset).squeeze()
-            deepmimo_data.append({"scenario": f"{scenario_name} - {bs_idx}", "channels": cleaned_deepmimo_data})
-        # Those properties will be useful during the sampling
+    
+    # Create a list of all (scenario, bs) pairs to iterate over
+    generation_tasks = [(name, idx) for name in scenario_names for idx in bs_idxs]
+
+    # Use tqdm for a user-friendly progress bar
+    print(f"Generating data for {len(generation_tasks)} scenario-BS pairs...")
+    for scenario_name, bs_idx in tqdm(generation_tasks, desc="Data Generation"):
+        parameters = get_parameters(scenario_name, bs_idx)
+        # The [0] index selects the user data from the DeepMIMO output
+        raw_deepmimo_data = DeepMIMOv3.generate_data(parameters)[0]
+        cleaned_channels = deepmimo_data_cleaning(raw_deepmimo_data)
+        deepmimo_data.append({"scenario": f"{scenario_name} - BS{bs_idx}", "channels": cleaned_channels})
+
     return deepmimo_data
 
-def sample(deepmimo_data, N_samples, n_users):
+def sample(deepmimo_data: list[dict], N_samples: int, n_users: int) -> list[dict]:
+    """Generates samples by randomly selecting a scenario and a subset of users' channels.
+
+    Each sample consists of channel data for 'n_users' randomly chosen users
+    from a randomly selected scenario.
+
+    Args:
+        deepmimo_data: A list of dictionaries, where each dict contains
+                       'scenario' (str) and 'channels' (np.ndarray) data.
+        N_samples: The total number of samples to generate.
+        n_users: The number of users (channels) to select for each sample.
+
+    Returns:
+        A list of dictionaries, each representing a sample with 'scenario' and
+        'channels' (np.ndarray of shape (n_users, ...)).
+    """
     samples = []
 
-    for i in tqdm(range(N_samples), desc="Sampling"):
+    for _ in tqdm(range(N_samples), desc="Sampling"):
+        # Randomly select a scenario from the deepmimo_data list
         scenario_idx = np.random.randint(0, len(deepmimo_data))
-        selected_scenario = deepmimo_data[scenario_idx]["scenario"]
+        selected_scenario_data = deepmimo_data[scenario_idx]
+        
+        # Randomly select 'n_users' channel indices from the chosen scenario
+        num_available_users = selected_scenario_data["channels"].shape[0] # Use shape[0] for number of users
+        ue_idxs = np.random.choice(num_available_users, n_users, replace=False) # Use np.random.choice for unique indices
+        
+        selected_channels = selected_scenario_data["channels"][ue_idxs]
 
-        ue_idxs = np.random.randint(0, len(deepmimo_data[scenario_idx]), n_users)
-        selected_users = deepmimo_data[scenario_idx]["channels"][ue_idxs]
-
-        samples.append({"scenario": selected_scenario, "channels": selected_users})
+        samples.append({"scenario": selected_scenario_data["scenario"], "channels": selected_channels})
 
     return samples
+
+def create_dataset(scenario_names: list[str] = None,
+                   bs_idxs: list[int] = None,
+                   n_samples:int = 100,
+                   n_users: int = 4,
+                   patch_rows: int = 4,
+                   patch_cols: int = 4):
+    """
+
+    """
+    deepmimo_data = deepmimo_data_gen(scenario_names, bs_idxs)
+    dataset = sample(deepmimo_data, n_samples, n_users)
+
+    # 2. Prepare all data for batch inference
+    all_tokens = []
+    for item in tqdm(dataset, desc="Preparing data"):
+        # Prepare input tokens for the LWM model
+        patches = patch_maker(item["channels"], patch_rows, patch_cols)
+        tokens = tokenizer(patches)
+        all_tokens.append(tokens)
+
+        # Reshape channel data for the next stage (the regressor model)
+        # Original shape: (K, 1, M, S) -> (4, 1, 16, 32)
+        # Squeezed shape: (K, M, S) -> (4, 16, 32)
+        # Transposed shape: (S, K, M) -> (32, 4, 16)
+        item["channels"] = item["channels"].squeeze().transpose(2, 0, 1)
+
+    # Stack all tokens into a single tensor for efficient processing
+    # Shape changes from a list of [N_USERS, ...] tensors to one [N_SAMPLES * N_USERS, ...] tensor
+    all_tokens_tensor = torch.cat(all_tokens, dim=0)
+    all_channels_array = np.array([d['channels'] for d in dataset]) # (N, S, K, M)
+
+    return all_tokens_tensor, all_channels_array
+
