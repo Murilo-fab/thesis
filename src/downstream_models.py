@@ -15,7 +15,7 @@ class RegressionHead(nn.Module):
             nn.Linear(512, 256),     
             nn.ReLU(),                 
             nn.Dropout(0.1),          
-            nn.Linear(256, n_users * n_antennas)      
+            nn.Linear(256, n_antennas)      
         )
         # MLP Head
         #self.net = nn.Sequential(
