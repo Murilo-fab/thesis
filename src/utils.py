@@ -1,40 +1,30 @@
 import ast
 
-from torch import nn
 import torch
-from torch.utils.data import TensorDataset, DataLoader, random_split
+from torch.utils.data import TensorDataset, DataLoader, random_split, Subset
 
 import warnings
 warnings.filterwarnings("ignore", message="Length of split at index")
 
-LN2 = torch.log(torch.tensor(2.0))
-EPS = 1e-12
-
-def load_lwm_model(base_model: torch.nn.Module, model_path: str, device: torch.device) -> torch.nn.Module:
-    """Loads the pre-trained LWM model and prepares it for inference"""
-    print("Loading LWM model...")
-    model = base_model
-    
-    state_dict = torch.load(model_path, map_location=device)
-    # Remove 'module.' prefix if the model was saved with DataParallel
-    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(new_state_dict)
-
-    # Use DataParallel if multiple GPUs are available 
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for inference.")
-        model = nn.DataParallel(model)
-
-    model.eval() # Set model to evaluation mode
-    print("Model loaded successfully.")
-    return model
-
 def prepare_loaders(channels_tensor: torch.Tensor,
+                    tokens_tensor: torch.Tensor,
                     split: list[int] = [0.7, 0.2, 0.1],
                     batch_size: int = 32,
                     seed: int = None):
-    
-    base_dataset = TensorDataset(channels_tensor)
+    """
+    Creates a train, validation and test loader;
+
+    Inputs:
+    channels_tensor (torch.Tensor): The raw channels tensor
+    tokens_tensor (torch.Tensor): The raw tokens tensor
+    split (list[int]): The split ratio between train, validation and test
+    batch_size (int): Size of each batch
+    seed (int): Seed for the generator
+
+    Outputs:
+    train_loader, val_loader, test_loader (DataLoader)
+    """
+    base_dataset = TensorDataset(channels_tensor, tokens_tensor)
     
     if seed is not None:
         generator = torch.Generator().manual_seed(42)
@@ -47,6 +37,40 @@ def prepare_loaders(channels_tensor: torch.Tensor,
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, test_loader
+
+def get_subset(data_loader: DataLoader,
+               ratio: float,
+               batch_size: int=None,
+               seed: int=None):
+    """
+    Returns a fraction of the original DataLoader
+
+    Inputs:
+    data_loader (DataLoader)
+    ratio (float)
+    batch_size (int): Size of each batch
+    seed (int): Seed for the generator
+
+    Outputs:
+    fraction_data_loader (DataLoader)
+    """
+    dataset = data_loader.dataset
+    n_samples = len(dataset)
+    n_subset = max(1, int(ratio * n_samples))
+
+    generator = torch.Generator()
+    if seed is not None:
+        generator.manual_seed(seed)
+
+    indices = torch.randperm(n_samples, generator=generator)[:n_subset]
+    subset = Subset(dataset, indices)
+
+    batch_size = batch_size or data_loader.batch_size
+
+    return DataLoader(subset,
+                      batch_size=batch_size,
+                      shuffle=True)
+
 
 def get_parameters(src: str):
     parameters = {}

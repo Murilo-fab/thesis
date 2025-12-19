@@ -1,11 +1,18 @@
+# General imports
 import os
 import csv
+import math
+from datetime import datetime
 from tqdm import tqdm, trange
+
+# Torch imports
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
+
+# Matplotlib
 import matplotlib.pyplot as plt
 
-from power_allocation import sum_rate_loss
 
 def nmse_loss(y_pred, y_true):
     y_pred_flat = y_pred.view(y_pred.size(0), -1)
@@ -111,26 +118,26 @@ def train_lwm(model, train_loaders, val_loaders, optimizer, scheduler, epochs, d
     return model
 
 def train_downstream_model(model: nn.Module,
-                           p_total: float,
-                           noise_variance: float,
-                           train_loader: torch.utils.data.DataLoader,
-                           val_loader: torch.utils.data.DataLoader,
-                           optimizer: torch.optim.Optimizer,
-                           scheduler, 
-                           epochs: int,
-                           device: torch.device,
-                           log_file: str = None,
-                           save_dir: str = None):
+                           train_loader,
+                           val_loader,
+                           optimizer_config,
+                           criterion,
+                           epochs,
+                           device,
+                           results_folder):
 
-    if save_dir:
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+    time_now = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    results_folder = f"{results_folder}/{time_now}"
+    os.makedirs(results_folder, exist_ok=True)
+    log_file = os.path.join(results_folder, "training_log.csv")
 
-    if log_file:
-        if not os.path.exists(log_file):
-            with open(log_file, mode="w", newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow(["Epoch", "Train Rate", "Validation Rate", "Learning Rate", "Best Model"])
+    with open(log_file, mode="w", newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "Train Rate", "Validation Rate", "Learning Rate", "Time"])
+    
+    model = model.to(device)
+
+    optimizer = torch.optim.Adam(model.task_head.parameters(), lr=optimizer_config["task_head_lr"])
 
     best_val_loss = float('inf')
     trange_epochs = trange(epochs)
@@ -140,13 +147,14 @@ def train_downstream_model(model: nn.Module,
         model.train()
         train_loss = 0.0
 
-        for batch_idx, (batch_channels,) in enumerate(train_loader):
-            batch_channels = batch_channels.to(device)
+        for batch in train_loader:
+            batch_channels = batch[0].to(device)
+            batch_tokens = batch[1].to(device)
 
             optimizer.zero_grad()
-            p_pred = model(batch_channels, p_total)
+            pred = model(batch_tokens)
 
-            loss = sum_rate_loss(p_pred, batch_channels, noise_variance)
+            loss = criterion(pred, batch_channels)
             loss.backward()
             optimizer.step()
 
@@ -157,37 +165,151 @@ def train_downstream_model(model: nn.Module,
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch_idx, (batch_channels,) in enumerate(val_loader):
-                batch_channels = batch_channels.to(device)
+            for batch in val_loader:
+                batch_channels = batch[0].to(device)
+                batch_tokens = batch[1].to(device)
 
-                p_pred = model(batch_channels, p_total)
+                pred = model(batch_tokens)
 
-                loss = sum_rate_loss(p_pred, batch_channels, noise_variance)
+                loss = criterion(pred, batch_channels)
                 val_loss += loss.item()
 
-        
         val_loss /= len(val_loader)
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(val_loss)
-        else:
-            scheduler.step()
+
+        time_now = datetime.now().strftime("%Y-%m-%d_%H-%M")
         
+        current_lr = optimizer.param_groups[0]['lr']
+
         trange_epochs.set_postfix({
             "Train Loss": train_loss, 
-            "Validation Loss": val_loss})
+            "Validation Loss": val_loss,
+            "LR": current_lr})
         
-        is_best_model = False
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            if save_dir:
-                model_path = os.path.join(save_dir, f"downstream_epoch{epoch}_train{train_loss:.4f}_val{val_loss:.4f}.pth")
-                torch.save(model.state_dict(), model_path)
-                print(f"Model saved: {model_path}")
-            is_best_model = True
+            best_state_dict = model.state_dict()
+
+        with open(log_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch+1, train_loss, val_loss, current_lr, time_now])
         
-        if log_file:
-            with open(log_file, mode='a', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([epoch+1, train_loss, val_loss, scheduler.get_last_lr()[0], is_best_model])
+    model_path = os.path.join(results_folder, f"model_{time_now}.pth")
+    torch.save(best_state_dict, model_path)
+
+    return model
+
+def cosine_with_warmup_scheduler(optimizer, warmup_steps, total_steps):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+def finetune(model,
+             train_loader,
+             val_loader,
+             fine_tune_layers,
+             optimizer_config,
+             criterion,
+             epochs,
+             warmup_epochs,
+             device,
+             results_folder):
+    
+    time_now = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    results_folder = f"{results_folder}/{time_now}"
+    os.makedirs(results_folder, exist_ok=True)
+    log_file = os.path.join(results_folder, "training_log.csv")
+
+    with open(log_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "Train Loss", "Validation Loss", "Learning Rate - Task Head", "Learning Rate - Encoder", "Time"])
+    
+    model = model.to(device)
+    # Set up optimizer
+    optimizer = torch.optim.AdmaW([
+        {
+            "params": model.task_head.parameters(),
+            "lr": optimizer_config["task_head_lr"]
+        },
+        {
+            "params": model.encoder.parameters(),
+            "lr": optimizer_config["encoder_lr"]
+        }
+    ])
+    # Set up scheduler with linear warmup and cosine
+    steps_per_epoch = len(train_loader)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = epochs * steps_per_epoch
+
+    scheduler = cosine_with_warmup_scheduler(
+        optimizer,
+        warmup_steps,
+        total_steps
+    )
+
+    best_val_loss = float('inf')
+    trange_epochs = trange(epochs)
+    for epoch in trange_epochs:
+        if epoch == warmup_epochs:
+            model.fine_tune(fine_tune_layers)
         
+        model.train()
+        train_loss = 0.0
+
+        for batch in train_loader:
+            batch_channels = batch[0].to(device)
+            batch_tokens = batch[1].to(device)
+
+            optimizer.zero_grad()
+            pred = model(batch_tokens)
+
+            loss = criterion(pred, batch_channels)
+            loss.backward()
+
+            optimizer.step()
+            scheduler.step()
+
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch_channels = batch[0].to(device)
+                batch_tokens = batch[1].to(device)
+
+                pred = model(batch_tokens)
+
+                loss = criterion(pred, batch_channels)
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+
+        time_now = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+        head_lr = optimizer.param_groups[0]["lr"]
+        encoder_lr = optimizer.param_groups[1]["lr"]
+
+        trange_epochs.set_postfix({
+            "Train Loss": train_loss, 
+            "Validation Loss": val_loss,
+            "Head LR": head_lr,
+            "Encoder LR": encoder_lr})
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state_dict = model.state_dict()
+
+        with open(log_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch+1, train_loss, val_loss, head_lr, encoder_lr, time_now])
+
+    model_path = os.path.join(results_folder, f"model_{time_now}.pth")
+    torch.save(best_state_dict, model_path)
+    
     return model

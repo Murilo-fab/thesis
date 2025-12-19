@@ -1,9 +1,11 @@
+from typing import Optional, Literal
+
+# Torch imports
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-import warnings
-from typing import Optional, Literal
 from torch import nn, Tensor
 
+import warnings
 warnings.filterwarnings('ignore')
 
 def lwm_inference(
@@ -16,15 +18,15 @@ def lwm_inference(
     """
     Performs inference using the LWM model to generate embeddings.
 
-    Args:
-        model: The pre-trained model for inference. Can be None if input_type is 'raw'.
-        data: The input data tensor.
-        input_type: The type of output to generate.
-        device: The device to run inference on ('cpu' or 'cuda').
-        batch_size: The batch size for the dataloader.
+    Inputs:
+    model (torch.nn.Module): The pre-trained model for inference. Can be None if input_type is 'raw'.
+    data (torch.Tensor): The input data tensor.
+    input_type (str): The type of output to generate.
+    device (str): The device to run inference on ('cpu' or 'cuda').
+    batch_size (int): The batch size for the dataloader.
 
-    Returns:
-        The resulting tensor from the inference process.
+    Outputs:
+    output (torch.Tensor): The resulting tensor from the inference process.
     """
     if input_type == "raw":
         return torch.tensor(data).float()
@@ -42,7 +44,7 @@ def lwm_inference(
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch[0].to(device)
-            output = model(input_ids)[0]
+            output, _ = model(input_ids)
 
             if input_type == "cls_emb":
                 batch_embeddings = output[:, 0, :]
