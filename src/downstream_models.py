@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from torch.functional import F
 
@@ -29,11 +28,19 @@ class RegressionHead(nn.Module):
         # 1. MLP Pass
         # PyTorch Linear layers automatically work on the last dimension, 
         # so [B, K, D] -> [B, K, S] works without flattening.
-        raw_scores = self.net(x) 
+        raw_scores = self.net(x)
+
+        B, K, S = raw_scores.shape
+
+        # 2. Flatten K and S dimensions
+        # We merge Users and Subcarriers into one pool: [B, K*S]
+        flat_scores = raw_scores.view(B, -1)
         
-        # 2. Power Constraint (Internalized)
-        # Apply Softmax along Dimension 1 (Users)
-        power_weights = F.softmax(raw_scores, dim=1)
+        # 3. Apply Global Softmax
+        weights = F.softmax(flat_scores, dim=1)
+
+        # 4. Reshape back
+        power_weights = weights.view(B, K, S)
         
         return power_weights
     

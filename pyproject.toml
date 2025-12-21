@@ -16,5 +16,7 @@ dependencies = [
     "DeepMIMOv3",
     "torch",
     "numpy",
-    "trackio"
+    "trackio",
+    "tqdm",
+    "matplotlib"
 ]

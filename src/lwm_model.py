@@ -129,7 +129,9 @@ class lwm(nn.Module):
     @classmethod
     def from_pretrained(cls, ckpt_name='model_weights.pth', device='cuda'):
         model = cls().to(device)
-        model.load_state_dict(torch.load(ckpt_name, map_location=device))
+        state_dict = torch.load(ckpt_name, map_location=device)
+        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(new_state_dict)
         print(f"Model loaded successfully from {ckpt_name}")
         return model
 

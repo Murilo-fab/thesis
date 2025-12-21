@@ -34,7 +34,10 @@ class DeepMIMOGenerator:
     user_gains (np.array): Gains of all users [K,]
     h_spatial (np.array): Normalized center carrier of each user [K, N]
     """
-    def __init__(self, scenario_name: str='city_6_miami', bs_idx: int=1, scenario_folder: str="./scenarios"):
+    def __init__(self,
+                 scenario_name: str = 'city_6_miami',
+                 bs_idx: int = 1,
+                 scenario_folder: str = "./scenarios"):
         """
         Initialize the DeepMIMO dataset generator.
         Generates the channels, gains and normalized center carrier.
@@ -52,7 +55,10 @@ class DeepMIMOGenerator:
         self.all_channels, self.num_total_users = self.get_channels()
         self.user_gains, self.h_spatial = self.get_matrices()
 
-    def get_parameters(self, scenario: str, bs_idx: int = 1, scenario_folder: str="./scenarios") -> dict:
+    def get_parameters(self,
+                       scenario: str,
+                       bs_idx: int = 1,
+                       scenario_folder: str = "./scenarios") -> dict:
         """
         Constructs the parameter dictionary for DeepMIMOv3 data generation.
 
@@ -97,11 +103,11 @@ class DeepMIMOGenerator:
         # 6. OFDM configuration
         parameters['OFDM']['subcarriers'] = n_subcarriers
         parameters['OFDM']['selected_subcarriers'] = np.arange(n_subcarriers)
-        parameters['OFDM']['bandwidth'] = (DEFAULT_SUBCARRIER_SPACING * n_subcarriers) / 1e9  # GHz
+        parameters['OFDM']['bandwidth'] = 0.02 # 20 MHz for 16 or 32 carriers # 100 MHz for 64 or 128 carriers# (DEFAULT_SUBCARRIER_SPACING * n_subcarriers) / 1e9  # GHz
 
         return parameters, n_subcarriers, n_ant_bs
     
-    def get_channels(self):
+    def get_channels(self) -> tuple[np.ndarray, int]:
         """
         Generates the all channels using DeepMIMO.
         Removes users without a path to the BS.
@@ -110,7 +116,7 @@ class DeepMIMOGenerator:
         Inputs:
 
         Outputs:
-        all_channels (np.array): Array with all channels in the scenario [K, N, SC]
+        all_channels (np.ndarray): Array with all channels in the scenario [K, N, SC]
         num_total_users (int): Total number of users in the dataset [K]
         """
         # 1. Users DeepMIMO to generated the data
@@ -126,15 +132,15 @@ class DeepMIMOGenerator:
 
         return all_channels, num_total_users
     
-    def get_matrices(self):
+    def get_matrices(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Generates the gains and spatial signatures matrices
         
         Inputs:
 
         Outputs:
-        user_gains (np.array): Gains of all users [K,]
-        h_spatial (np.array): Normalized center carrier of each user [K, N]
+        user_gains (np.ndarray): Gains of all users [K,]
+        h_spatial (np.ndarray): Normalized center carrier of each user [K, N]
         """
         # 1. Gains (Average Power over subcarriers)
         user_gains = np.linalg.norm(self.all_channels, axis=(1, 2))**2 / self.n_subcarriers
@@ -151,7 +157,7 @@ class DeepMIMOGenerator:
                                 target_user_idx: int,
                                 min_corr: float,
                                 max_corr: float,
-                                max_gain_ratio: float):
+                                max_gain_ratio: float) -> tuple[np.ndarray, np.ndarray]:
         """
         Generates a mask with the valid users based on gain and correlation conditions
 
@@ -162,8 +168,8 @@ class DeepMIMOGenerator:
         max_gain_ratio (float): Maximum gain ratio between users
 
         Outputs:
-        mask_corr (np.array): The mask of users with valid correlation [K,]
-        mask_gain (np.array): The mask of users with valid gain [K,]
+        mask_corr (np.ndarray): The mask of users with valid correlation [K,]
+        mask_gain (np.ndarray): The mask of users with valid gain [K,]
         """
         # 1. Vectorized Correlation
         target_vec = self.h_spatial[target_user_idx]
@@ -184,9 +190,9 @@ class DeepMIMOGenerator:
     def generate_dataset(self,
                          num_samples: int,
                          num_users: int,
-                         min_corr: float=0.5,
-                         max_corr: float=0.9,
-                         max_gain_ratio: float=20.0):
+                         min_corr: float = 0.5,
+                         max_corr: float = 0.9,
+                         max_gain_ratio: float = 20.0) -> tuple[np.ndarray, np.ndarray]:
         """
         Sample users and generate a dataset with minimum and maximum correlation between users
         and a maximum gain ratio between users.
@@ -254,7 +260,11 @@ class Tokenizer:
     cls_value (float): The value that represents the CLS token
     scale_factor (int): The scale factor for normalization
     """
-    def __init__(self, patch_rows: int, patch_cols: int, cls_value: float=0.2, scale_factor: int=1e6):
+    def __init__(self,
+                 patch_rows: int,
+                 patch_cols: int,
+                 cls_value: float = 0.2,
+                 scale_factor: int = 1e6):
         """
         Constrcutor of the tokenizer
 
@@ -269,7 +279,8 @@ class Tokenizer:
         self.cls_value = cls_value
         self.scale_factor = scale_factor
 
-    def patching(self, x_complex: torch.Tensor) -> torch.Tensor:
+    def patching(self,
+                 x_complex: torch.Tensor) -> torch.Tensor:
         """
         Generates patches from the complex channels
         
@@ -322,7 +333,8 @@ class Tokenizer:
 
         return patches
     
-    def tokenizing(self, patches: torch.Tensor):
+    def tokenizing(self,
+                   patches: torch.Tensor) -> torch.Tensor:
         """
         Generates tokens used in the LWM from tokens.
         Basically, prepends a CLS token in the beginning of the token sequence
@@ -348,7 +360,8 @@ class Tokenizer:
         # 2. Prepend CLS
         return torch.cat([cls_tokens, patches], dim=1)
     
-    def __call__(self, x_complex: torch.Tensor) -> torch.Tensor:
+    def __call__(self,
+                 x_complex: torch.Tensor) -> torch.Tensor:
         """
         Transform the complex wireless channel into a sequence of tokens and multiplies for normalization.
         
@@ -365,7 +378,7 @@ class Tokenizer:
             batch_dim, user_dim, n_rows, n_cols = x_complex.shape
             # Flatten Batch and User together for processing
             # New shape: (B*Users, M, S)
-            x_processing = x_complex.view(-1, n_rows, n_cols)
+            x_processing = x_complex.reshape(-1, n_rows, n_cols)
 
         elif input_ndim == 3:
             # Case B: (Batch, M, S)
@@ -406,17 +419,17 @@ class PowerAllocationDataset(Dataset):
     def __init__(self,
                  num_samples: int,
                  num_users: int,
-                 min_corr: float=0.5,
-                 max_corr: float=0.9,
-                 max_gain_ratio: float=20.0,
-                 scenario_name: str="city_6_miami",
-                 bs_idx: int=1,
-                 scenario_folder: str="./scenarios",
-                 preprocess_tokens=True,
-                 patch_rows: int=4,
-                 patch_cols: int=4,
-                 cls_value: float=0.2,
-                 scale_factor: int=1e6):
+                 min_corr: float = 0.5,
+                 max_corr: float = 0.9,
+                 max_gain_ratio: float = 20.0,
+                 scenario_name: str = "city_6_miami",
+                 bs_idx: int = 1,
+                 scenario_folder: str = "./scenarios",
+                 preprocess_tokens = True,
+                 patch_rows: int = 4,
+                 patch_cols: int = 4,
+                 cls_value: float = 0.2,
+                 scale_factor: int = 1e6):
         """
         Creates the dataset for Power Allocation Task
 
@@ -457,10 +470,8 @@ class PowerAllocationDataset(Dataset):
             max_corr=max_corr, 
             max_gain_ratio=max_gain_ratio
         )
-        # Reshapes the raw channels from (Samples, Users, Antennas, Subcarriers) (0, 1, 2, 3)
-        # To [Samples, Subcarriers, Users, Antennas] (0, 3, 1, 2)
-        # This is the format used in the Power Allocation Solver
-        self.raw_channels = torch.tensor(raw_channels_np, dtype=torch.complex64).transpose(0, 3, 1, 2)
+
+        raw_channels = torch.tensor(raw_channels_np, dtype=torch.complex64)
 
         if preprocess_tokens:
             self.tokenizer = Tokenizer(patch_rows=patch_rows,
@@ -468,12 +479,19 @@ class PowerAllocationDataset(Dataset):
                                        cls_value=cls_value,
                                        scale_factor=scale_factor)
             
-            self.data_tokens = self.tokenizer(self.raw_channels)
+            self.data_tokens = self.tokenizer(raw_channels)
 
-    def __len__(self):
+        # Reshapes the raw channels from (Samples, Users, Antennas, Subcarriers) (0, 1, 2, 3)
+        # To [Samples, Subcarriers, Users, Antennas] (0, 3, 1, 2)
+        # This is the format used in the Power Allocation Solver
+        # This must be after processing the Tokens because the Tokenizer uses the same format as DeepMIMO
+        self.raw_channels = raw_channels.permute(0, 3, 1, 2)
+
+    def __len__(self) -> int:
         return self.num_samples
     
-    def __getitem__(self, idx:int):
+    def __getitem__(self,
+                    idx:int) -> torch.Tensor:
         """
         Returns one sample. 
 

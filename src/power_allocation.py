@@ -3,7 +3,7 @@ import numpy as np
 
 epsilon = 1e-8
 
-def solve_water_filling(gains, P_total=1.0):
+def solve_water_filling(gains, P_total=1.0, noise_variance=1.0):
     """
     Solver for Water Filling
     
@@ -24,7 +24,7 @@ def solve_water_filling(gains, P_total=1.0):
     flat_gains = torch.clamp(flat_gains, min=1e-12)
 
     # 3. Calculate noise levels
-    noise_levels = 1.0 / flat_gains
+    noise_levels = noise_variance / flat_gains
 
     # 4. Sort noise levels from low to high / good to bad channels
     sorted_noise, indices = torch.sort(noise_levels, dim=-1)
@@ -42,10 +42,13 @@ def solve_water_filling(gains, P_total=1.0):
     valid = mu_candidates > sorted_noise
 
     # 8. Finds the max k that satisfy the criterion
-    k_optimal = torch.sum(valid, dim=-1, keepdim=True)
-
+    # We clamp min=1 to prevent k_optimal being 0. 
+    # This prevents the index from ever being -1.
+    k_optimal = torch.sum(valid, dim=-1, keepdim=True).clamp(min=1)
+    
     # 9. Selects the correct mu
-    mu_selected = torch.gather(mu_candidates, -1, k_optimal - 1)
+    k_idx = k_optimal - 1
+    mu_selected = torch.gather(mu_candidates, -1, k_idx)
 
     # 10. Calculates power: P = mu - noise
     sorted_powers = torch.clamp(mu_selected - sorted_noise, min=0)
@@ -58,7 +61,7 @@ def solve_water_filling(gains, P_total=1.0):
 
     return powers
 
-def apply_water_filling(W, H, P_total=1.0):
+def apply_water_filling(W, H, P_total=1.0, noise_variance=1.0):
     """
     Apply Water Filling to optimize the power allocation for a precoder
     
@@ -73,7 +76,7 @@ def apply_water_filling(W, H, P_total=1.0):
 
     # 1. Extract directions
     # Normalize the columns of W to unit form
-    V_directions = torch.nn.functional.normalize(W, p=2, dim=-2)
+    V_directions = torch.nn.functional.normalize(W, p=2, dim=-2, eps=1e-12)
 
     # 2. Calculate "effective channel" with those directions (H @ V)
     # Shape: (B, S, K, N) @ (B, S, N, K) : (B, S, K, K)
@@ -84,7 +87,7 @@ def apply_water_filling(W, H, P_total=1.0):
     effective_gains = torch.abs(signal_amplitudes)**2
 
     # 4. Solve Water Filling 
-    optimal_powers = solve_water_filling(effective_gains, P_total)
+    optimal_powers = solve_water_filling(effective_gains, P_total, noise_variance)
 
     # 5. Apply new powers
     W_opt = V_directions * torch.sqrt(optimal_powers.unsqueeze(-2))
