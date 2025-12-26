@@ -18,5 +18,7 @@ dependencies = [
     "numpy",
     "trackio",
     "tqdm",
-    "matplotlib"
+    "matplotlib",
+    "sklearn",
+    "seaborn"
 ]

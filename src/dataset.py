@@ -25,14 +25,14 @@ class DeepMIMOGenerator:
     Represents a DeepMIMO dataset generator
 
     Attributes:
-    scenario_name (str): The scenario name used in the dataset
-    bs_idx (int): The index of the active base station
-    scenario_folder (str): Path to to the directory with the scenarios
-    params (dict): A dict with DeepMIMO parameters
-    all_channels (np.array): Array with all channels in the scenario [K, N, SC]
-    num_total_users (int): Total number of users in the dataset [K]
-    user_gains (np.array): Gains of all users [K,]
-    h_spatial (np.array): Normalized center carrier of each user [K, N]
+        scenario_name (str): The scenario name used in the dataset
+        bs_idx (int): The index of the active base station
+        scenario_folder (str): Path to to the directory with the scenarios
+        params (dict): A dict with DeepMIMO parameters
+        all_channels (np.array): Array with all channels in the scenario [K, N, SC]
+        num_total_users (int): Total number of users in the dataset [K]
+        user_gains (np.array): Gains of all users [K,]
+        h_spatial (np.array): Normalized center carrier of each user [K, N]
     """
     def __init__(self,
                  scenario_name: str = 'city_6_miami',
@@ -43,9 +43,9 @@ class DeepMIMOGenerator:
         Generates the channels, gains and normalized center carrier.
         
         Inputs:
-        scenario_name (str): The name of the selected scenario
-        bs_idx (int): The index of the active base station
-        scenario_folder (str): Path to to the directory with the scenarios
+            scenario_name (str): The name of the selected scenario
+            bs_idx (int): The index of the active base station
+            scenario_folder (str): Path to to the directory with the scenarios
         """
         self.scenario_name = scenario_name
         self.bs_idx = bs_idx
@@ -63,11 +63,11 @@ class DeepMIMOGenerator:
         Constructs the parameter dictionary for DeepMIMOv3 data generation.
 
         Inputs:
-        scenario (str): The name of the scenario (e.g., 'city_6_miami_v1').
-        bs_idx (int): The index of the active base station.
+            scenario (str): The name of the scenario (e.g., 'city_6_miami_v1').
+            bs_idx (int): The index of the active base station.
 
         Outputs:
-        parameters (dict): A dictionary of parameters compatible with DeepMIMOv3.generate_data.
+            parameters (dict): A dictionary of parameters compatible with DeepMIMOv3.generate_data.
         """
         # 1. Retrieves scenario-specific properties (e.g., antenna counts)
         scenario_configs = scenario_prop()
@@ -116,8 +116,8 @@ class DeepMIMOGenerator:
         Inputs:
 
         Outputs:
-        all_channels (np.ndarray): Array with all channels in the scenario [K, N, SC]
-        num_total_users (int): Total number of users in the dataset [K]
+            all_channels (np.ndarray): Array with all channels in the scenario [K, N, SC]
+            num_total_users (int): Total number of users in the dataset [K]
         """
         # 1. Users DeepMIMO to generated the data
         deepmimo_data = DeepMIMOv3.generate_data(self.params)
@@ -139,8 +139,8 @@ class DeepMIMOGenerator:
         Inputs:
 
         Outputs:
-        user_gains (np.ndarray): Gains of all users [K,]
-        h_spatial (np.ndarray): Normalized center carrier of each user [K, N]
+            user_gains (np.ndarray): Gains of all users [K,]
+            h_spatial (np.ndarray): Normalized center carrier of each user [K, N]
         """
         # 1. Gains (Average Power over subcarriers)
         user_gains = np.linalg.norm(self.all_channels, axis=(1, 2))**2 / self.n_subcarriers
@@ -162,14 +162,14 @@ class DeepMIMOGenerator:
         Generates a mask with the valid users based on gain and correlation conditions
 
         Inputs:
-        target_iser_idx (int): The index of the compared user
-        min_corr (float): Minimum correlation between users
-        max_corr (float): Maximum correlation beween users
-        max_gain_ratio (float): Maximum gain ratio between users
+            target_iser_idx (int): The index of the compared user
+            min_corr (float): Minimum correlation between users
+            max_corr (float): Maximum correlation beween users
+            max_gain_ratio (float): Maximum gain ratio between users
 
         Outputs:
-        mask_corr (np.ndarray): The mask of users with valid correlation [K,]
-        mask_gain (np.ndarray): The mask of users with valid gain [K,]
+            mask_corr (np.ndarray): The mask of users with valid correlation [K,]
+            mask_gain (np.ndarray): The mask of users with valid gain [K,]
         """
         # 1. Vectorized Correlation
         target_vec = self.h_spatial[target_user_idx]
@@ -198,15 +198,15 @@ class DeepMIMOGenerator:
         and a maximum gain ratio between users.
 
         Inputs:
-        num_samples (int): Number of samples in the final dataset
-        num_users (int): Number of users in each sample
-        min_corr (float): Minimum correlation between users
-        max_corr (float): Maximum correlation beween users
-        max_gain_ratio (float): Maximum gain ratio between users
+            num_samples (int): Number of samples in the final dataset
+            num_users (int): Number of users in each sample
+            min_corr (float): Minimum correlation between users
+            max_corr (float): Maximum correlation beween users
+            max_gain_ratio (float): Maximum gain ratio between users
 
         Outputs:
-        dataset_H (np.array): The final channel dataset [B, K, N, SC]
-        indices (np.array): The indices of selected users [B, K]
+            dataset_H (np.array): The final channel dataset [B, K, N, SC]
+            indices (np.array): The indices of selected users [B, K]
         """
         dataset_indices = []
         pbar = tqdm(total=num_samples, desc="Generating Scenarios")
@@ -255,10 +255,10 @@ class Tokenizer:
     A Tokenizer that generates tokens for the LWM from wireless channels
 
     Attributes:
-    patch_rows (int): The number of rows used in each patch
-    patch_cols (int): The number of columns used in each patch
-    cls_value (float): The value that represents the CLS token
-    scale_factor (int): The scale factor for normalization
+        patch_rows (int): The number of rows used in each patch
+        patch_cols (int): The number of columns used in each patch
+        cls_value (float): The value that represents the CLS token
+        scale_factor (int): The scale factor for normalization
     """
     def __init__(self,
                  patch_rows: int,
@@ -269,10 +269,10 @@ class Tokenizer:
         Constrcutor of the tokenizer
 
         Inputs:
-        patch_rows (int): The number of rows used in each patch
-        patch_cols (int): The number of columns used in each patch
-        cls_value (float): The value that represents the CLS token
-        scale_factor (int): The scale factor for normalization
+            patch_rows (int): The number of rows used in each patch
+            patch_cols (int): The number of columns used in each patch
+            cls_value (float): The value that represents the CLS token
+            scale_factor (int): The scale factor for normalization
         """
         self.patch_rows = patch_rows
         self.patch_cols = patch_cols
@@ -285,10 +285,10 @@ class Tokenizer:
         Generates patches from the complex channels
         
         Inputs:
-        x_complex (torch.Tensor): The complex wireless channel [B, M, N, SC] or [B, N, SC]
+            x_complex (torch.Tensor): The complex wireless channel [B, M, N, SC] or [B, N, SC]
 
         Outputs:
-        patches (torch.Tensor): The final patches [B, Patches, Features]
+            patches (torch.Tensor): The final patches [B, Patches, Features]
         """
         # Step 1: Dimension check
         # Remove Singleton dimension - Currently, the LWM model uses only one antenna in the UE
@@ -340,10 +340,10 @@ class Tokenizer:
         Basically, prepends a CLS token in the beginning of the token sequence
 
         Inputs:
-        patches (torch.Tensor): The patches used to produce tokens [B, Patches, Features]
+            patches (torch.Tensor): The patches used to produce tokens [B, Patches, Features]
 
         Outputs:
-        tokens (torch.Tensor): The sequence of tokens [B, Sequence Length, Features]
+            tokens (torch.Tensor): The sequence of tokens [B, Sequence Length, Features]
         """
         batch_size = patches.shape[0]
         features = patches.shape[-1]
@@ -366,12 +366,13 @@ class Tokenizer:
         Transform the complex wireless channel into a sequence of tokens and multiplies for normalization.
         
         Inputs:
-        x_complex (torch.Tensor): The complex wireless channel [B, K, N, SC] or [B, N, SC]
+            x_complex (torch.Tensor): The complex wireless channel [B, K, N, SC] or [B, N, SC]
 
         Outputs:
-        tokens (torch.Tensor): The sequence of tokens [B, K, Sequence Length, Features] or [B, Sequence Length, Features]
+            tokens (torch.Tensor): The sequence of tokens [B, K, Sequence Length, Features] or [B, Sequence Length, Features]
         """
-        input_ndim = x_complex.ndim
+        input_ndim = x_complex.ndim 
+        x_complex = x_complex * self.scale_factor # Scale factor for LWM
         # 1. Handle dimensions
         if input_ndim == 4:
             # Case A: (Batch, Users, M, S)
@@ -398,7 +399,7 @@ class Tokenizer:
 
             tokens = tokens.view(batch_dim, user_dim, seq_len, token_dim)
 
-        return tokens * self.scale_factor # Scale factor for LWM
+        return tokens
     
 class PowerAllocationDataset(Dataset):
     """
@@ -406,15 +407,15 @@ class PowerAllocationDataset(Dataset):
     Creates channels and tokens that are ready for the LWM model
 
     Attributes:
-    num_samples (int): Number of samples in the dataset
-    num_users (int): Number of users in each sample
-    generator (DeepMIMOGenerator): a DeepMIMO dataset generator
-    min_corr (float): Minimum correlation between users
-    max_corr (float): Maximum correlation beween users
-    max_gain_ratio (float): Maximum gain ratio between users
-    raw_channels (torch.Tensor): The raw channel dataset [B, SC, K, N]
-    tokenizer (Tokenizer) [Optional]: Tokenizer that generates tokens for the LWM from wireless channels
-    data_tokens (torch.Tensor) [Optional]: Dataset with tokens [B, K, Sequence Length, Features]
+        num_samples (int): Number of samples in the dataset
+        num_users (int): Number of users in each sample
+        generator (DeepMIMOGenerator): a DeepMIMO dataset generator
+        min_corr (float): Minimum correlation between users
+        max_corr (float): Maximum correlation beween users
+        max_gain_ratio (float): Maximum gain ratio between users
+        raw_channels (torch.Tensor): The raw channel dataset [B, SC, K, N]
+        tokenizer (Tokenizer) [Optional]: Tokenizer that generates tokens for the LWM from wireless channels
+        data_tokens (torch.Tensor) [Optional]: Dataset with tokens [B, K, Sequence Length, Features]
     """
     def __init__(self,
                  num_samples: int,
@@ -434,19 +435,19 @@ class PowerAllocationDataset(Dataset):
         Creates the dataset for Power Allocation Task
 
         Inputs:
-        num_samples (int): Number of samples in the dataset
-        num_users (int): Number of users in each sample
-        min_corr (float): Minimum correlation between users
-        max_corr (float): Maximum correlation beween users
-        max_gain_ratio (float): Maximum gain ratio between users
-        scenario_name (str): The name of the selected scenario
-        bs_idx (int): The index of the active base station
-        scenario_folder (str): Path to to the directory with the scenarios
-        preprocess_tokens (bool): True if it should also generate tokens
-        patch_rows (int): The number of rows used in each patch
-        patch_cols (int): The number of columns used in each patch
-        cls_value (float): The value that represents the CLS token
-        scale_factor (int): The scale factor for normalization
+            num_samples (int): Number of samples in the dataset
+            num_users (int): Number of users in each sample
+            min_corr (float): Minimum correlation between users
+            max_corr (float): Maximum correlation beween users
+            max_gain_ratio (float): Maximum gain ratio between users
+            scenario_name (str): The name of the selected scenario
+            bs_idx (int): The index of the active base station
+            scenario_folder (str): Path to to the directory with the scenarios
+            preprocess_tokens (bool): True if it should also generate tokens
+            patch_rows (int): The number of rows used in each patch
+            patch_cols (int): The number of columns used in each patch
+            cls_value (float): The value that represents the CLS token
+            scale_factor (int): The scale factor for normalization
         """
         super().__init__()
 
@@ -496,11 +497,11 @@ class PowerAllocationDataset(Dataset):
         Returns one sample. 
 
         Inputs:
-        idx (int): The index of the sample
+            idx (int): The index of the sample
 
         Outputs:
-        sample (torch.Tensor): Token [K, Sequence Length, Features] if preprocessed
-                               Channel [SC, K, N] else
+            sample (torch.Tensor): Token [K, Sequence Length, Features] if preprocessed
+                                   Channel [SC, K, N] else
         """
         if self.preprocess_tokens:
             # Return pre-calculated tokens

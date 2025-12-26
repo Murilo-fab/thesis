@@ -1,6 +1,7 @@
 # General imports
 import os
 import math
+import csv
 import trackio
 from datetime import datetime
 from tqdm import tqdm, trange
@@ -213,6 +214,12 @@ def train_downstream_model(model: nn.Module,
     start_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
     run_dir = os.path.join(save_dir, start_time)
     os.makedirs(run_dir, exist_ok=True)
+    log_file = os.path.join(run_dir, "training_log.csv")
+
+    # Initialize the CSV log
+    with open(log_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "Train Loss", "Validation Loss", "Learning Rate"])
     
     # 2. If trackio parameters are provided, initiate the tracker
     if trackio_params:
@@ -287,8 +294,14 @@ def train_downstream_model(model: nn.Module,
                 "Validation loss": val_loss,
                 "Learning rate": current_lr
             })
+        # Log results
+
+        with open(log_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch + 1, train_loss, val_loss, current_lr])
+
     # 11. Save the best model artifact to disk
-    model_path = os.path.join(save_dir, f"model_{start_time}.pth")
+    model_path = os.path.join(run_dir, f"model_{start_time}.pth")
     torch.save(best_state_dict, model_path)
 
     # 12. Finish the Trackio run safely
@@ -369,6 +382,12 @@ def finetune(model: nn.Module,
     start_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
     run_dir = os.path.join(save_dir, start_time)
     os.makedirs(run_dir, exist_ok=True)
+    log_file = os.path.join(run_dir, "training_log.csv")
+
+    # Initialize the CSV log
+    with open(log_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "Train Loss", "Validation Loss", "Learning Rate - Head", "Learning Rate - Encoder"])
 
     # 2. Initialize Trackio
     if trackio_params:
@@ -473,9 +492,13 @@ def finetune(model: nn.Module,
                 "Learning rate - Head": head_lr,
                 "Learning rate - Encoder": encoder_lr,
             })
+        
+        with open(log_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch + 1, train_loss, val_loss, head_lr, encoder_lr])
 
     # 12. Save Model Artifacts
-    model_path = os.path.join(save_dir, f"model_{start_time}.pth")
+    model_path = os.path.join(run_dir, f"model_{start_time}.pth")
     torch.save(best_state_dict, model_path)
 
     if trackio_params:

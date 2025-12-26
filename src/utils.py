@@ -162,3 +162,22 @@ def clone_scenarios(scenario_name: str,
     subprocess.run(["git", "lfs", "pull"], cwd=scenarios_path, check=True)
 
     print(f"Successfully cloned {scenario_name} into {scenario_path}.")
+
+def calculate_noise_power(bandwidth_ghz, noise_figure_db=9):
+    """
+    Calculates noise variance (sigma^2) in linear scale (Watts).
+    """
+    k_B = 1.380649e-23  # Boltzmann constant
+    T = 290             # Temperature (Kelvin)
+    BW_Hz = bandwidth_ghz * 1e9 # Convert GHz to Hz
+    
+    # Thermal Noise Density (N0)
+    noise_spectral_density = k_B * T 
+    
+    # Noise Figure in Linear Scale
+    noise_figure_linear = 10 ** (noise_figure_db / 10)
+    
+    # Total Noise Power
+    noise_power_watts = noise_spectral_density * BW_Hz * noise_figure_linear
+    
+    return noise_power_watts
