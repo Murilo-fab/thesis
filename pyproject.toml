@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Thesis"
+name = "thesis"
 version = "1.0.0"
 description = "Package for the thesis"
 readme = "README.md"
@@ -23,3 +23,6 @@ dependencies = [
     "seaborn",
     "faker"
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
