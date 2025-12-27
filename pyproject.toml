@@ -19,6 +19,7 @@ dependencies = [
     "trackio",
     "tqdm",
     "matplotlib",
-    "sklearn",
-    "seaborn"
+    "scikit-learn",
+    "seaborn",
+    "faker"
 ]
