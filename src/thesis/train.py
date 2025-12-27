@@ -6,7 +6,7 @@ import trackio
 from datetime import datetime
 from tqdm import tqdm, trange
 from typing import Optional, Dict
-from .utils import OptimizerConfigs, TrackioParams
+from thesis.utils import OptimizerConfigs, TrackioParams
 
 # Torch imports
 import torch

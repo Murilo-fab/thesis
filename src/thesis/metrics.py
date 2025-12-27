@@ -9,7 +9,7 @@ from sklearn.manifold import TSNE
 import torch
 
 # Telecommunication imports
-from .power_allocation import *
+from thesis.power_allocation import *
 
 epsilon = 1e-18
 

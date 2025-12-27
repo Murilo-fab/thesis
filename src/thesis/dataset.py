@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 
 # Telecommunication imports
 import DeepMIMOv3
-from .scenario_props import *
+from thesis.scenario_props import *
 
 import warnings
 warnings.filterwarnings('ignore')
