@@ -101,14 +101,11 @@ class PowerAllocator(nn.Module):
         final_scores = final_scores.permute(0, 2, 1)
         
         # Activation (Sigmoid mapped to 0-1)
-        p_raw = torch.sigmoid(final_scores * self.output_scale)
+        flat_scores = final_scores.reshape(B, -1)
+        flat_probs = F.softmax(flat_scores / self.temperature, dim=-1)
         
-        # Strict Power Constraint: Sum(P) <= 1.0
-        # Sum over Subcarriers (dim 1) AND Users (dim 2)
-        total_power = torch.sum(p_raw, dim=(1, 2), keepdim=True)
-        
+        p_allocated = flat_probs.reshape(B, self.S_target, K)        
         # Normalize strictly
-        p_allocated = p_raw / (total_power + 1e-8)
         
         return p_allocated
     
@@ -171,3 +168,79 @@ class Wrapper(nn.Module):
         power_weights = self.task_head(input_head)
 
         return power_weights
+    
+class CarrierAllocation(nn.Module):
+    def __init__(self, tokenizer, encoder, assignment_head, allocation_head, emb_dim: int = 128):
+        """
+        Wrapper for the Carrier Selection Task
+
+        """
+        super().__init__()
+
+        self.tokenizer = tokenizer
+        self.encoder = encoder
+        self.assignment_head = assignment_head
+        self.allocation_head = allocation_head
+        self.emb_dim = emb_dim
+
+        self.patch_rows = tokenizer.patch_rows
+        self.patch_cols = tokenizer.patch_cols
+
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def fine_tune(self, fine_tune_layers="full"):
+        if fine_tune_layers == "full":
+             for param in self.encoder.parameters():
+                    param.requires_grad = True
+        else:
+            for name, param in self.encoder.named_parameters():
+                if any(layer in name for layer in fine_tune_layers):
+                    param.requires_grad = True
+
+    def forward(self, channels, temperature=1.0):
+        """
+
+        Inputs:
+            channels: Shape (Samples, Users, Antennas, Subcarriers)
+        """
+        # 1. Extract channel shape
+        B, K, M, SC = channels.shape
+
+        # 2. Create tokens
+        # Shape: [B, K, Seq_length, Features]
+        tokens = self.tokenizer(channels)
+        _, _, S, F = tokens.shape
+
+        # 3. Flatten for Enconder
+        # Shape: [B*K, Seq_length, Features]
+        encoder_input = tokens.view(B*K, S, F)
+
+        # 4. Encoder
+        embeddings, _ = self.encoder(encoder_input)
+        channel_emb = embeddings[:, 1:, :]
+
+        # 5. Vertical and horizontal patches
+        patch_width_flat = self.patch_cols * 2
+        total_width_flat = SC * 2
+
+        # Padding
+        pad_rows = (self.patch_rows - (M % self.patch_rows)) % self.patch_rows
+        num_v = (M + pad_rows) // self.patch_rows
+
+        pad_cols = (patch_width_flat - (total_width_flat % patch_width_flat)) % patch_width_flat
+        num_h = (total_width_flat + pad_cols) // patch_width_flat
+
+        # 6. Recreate grid
+        grid = channel_emb.view(B*K, num_v, num_h, -1)
+        freq_features = torch.mean(grid, dim=1)
+
+        # 7. Reshape for tasks
+        user_embeddings = freq_features.view(B, K, num_h, -1)
+
+        # 8. Task heads
+        assignment_probs = self.assignment_head(user_embeddings, temperature=temperature)
+
+        power_values = self.allocation_head(user_embeddings, assignment_probs)
+
+        return assignment_probs, power_values

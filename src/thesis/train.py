@@ -2,11 +2,10 @@
 import os
 import math
 import csv
-import trackio
 from datetime import datetime
 from tqdm import tqdm, trange
 from typing import Optional, Dict
-from thesis.utils import OptimizerConfigs, TrackioParams
+from thesis.utils import OptimizerConfigs
 
 # Torch imports
 import torch
@@ -48,8 +47,7 @@ def train_lwm(model: nn.Module,
               scheduler: torch.optim.lr_scheduler.LRScheduler,
               epochs: int,
               device: torch.device,
-              save_dir: str,
-              trackio_params: Optional[TrackioParams] = None) -> nn.Module:
+              save_dir: str) -> nn.Module:
     """
     Trains a Large Wireless Model (LWM) with support for bucketed DataLoaders (by sequence length).
 
@@ -62,7 +60,6 @@ def train_lwm(model: nn.Module,
     epochs (int): Number of epochs to train.
     device (torch.device): Computation device.
     save_dir (str): Directory to save model checkpoints.
-    trackio_params (TrackioParams, optional): Parameters for experiment tracking.
 
     Outputs:
     nn.Module: The trained model.
@@ -72,22 +69,12 @@ def train_lwm(model: nn.Module,
     run_dir = os.path.join(save_dir, start_time)
     os.makedirs(run_dir, exist_ok=True)
 
-    # 2. Initialize Trackio
-    if trackio_params:
-        trackio.init(
-            project=trackio_params["project"],
-            name=trackio_params.get("name", f"LWM_Run_{start_time}"),
-            group=trackio_params.get("group", ""),
-            config=trackio_params.get("config", {}),
-            embed=False
-        )
-
     best_val_nmse = float('inf')
 
-    # 3. Epoch Loop
+    # 2. Epoch Loop
     for epoch in range(epochs):
 
-        # --- Training Phase ---
+        # 3. Training Phase
         model.train()
         train_nmse_accum = 0.0
         train_samples = 0
@@ -127,7 +114,7 @@ def train_lwm(model: nn.Module,
         # Calculate average training NMSE for the epoch
         avg_train_nmse = train_nmse_accum / max(train_samples, 1)
 
-        # --- Validation Phase (Every 2 epochs) ---
+        # 4. Validation Phase (Every 2 epochs)
         avg_val_nmse = None # Placeholder for logging
 
         if epoch % 2 == 0:
@@ -163,23 +150,6 @@ def train_lwm(model: nn.Module,
             print(f"\tTrain NMSE: {avg_train_nmse:.4f}")
             print(f"\tValidation NMSE: {avg_val_nmse:.4f}")
             print(f"\tLearning Rate: {scheduler.get_last_lr()[0]:.6f}")
-
-        # --- Logging to Trackio ---
-        if trackio_params:
-            # Prepare log dict
-            log_data = {
-                "Train NMSE": avg_train_nmse,
-                "Learning Rate": scheduler.get_last_lr()[0]
-            }
-            # Only log Validation NMSE if we actually ran validation this epoch
-            if avg_val_nmse is not None:
-                log_data["Validation NMSE"] = avg_val_nmse
-            
-            trackio.log(log_data)
-    
-    # 4. Finish Run
-    if trackio_params:
-        trackio.finish()
         
     print("Training complete.")
     return model
@@ -191,24 +161,22 @@ def train_downstream_model(model: nn.Module,
                            criterion: nn.Module,
                            epochs: int,
                            device: torch.device,
-                           save_dir: str,
-                           trackio_params: Optional[TrackioParams] = None) -> nn.Module:
+                           save_dir: str) -> nn.Module:
     """
     Train the downstream model
 
     Inputs:
-    model (nn.Module): The downstream model to be trained
-    train_loader (DataLoader): Loader for training data
-    val_loader (DataLoader): Loader for validation data
-    optimizer_config (OptimizerConfigs): Configuration dict, e.g., {"task_head_lr": 0.001}
-    criterion (nn.Module): Loss function
-    epochs (int): Number of training epochs
-    device (torch.device): Device to run training on (CPU/GPU)
-    save_dir (str): The parent directory where results will be saved
-    trackio_params (TrackioParams, optional): Parameters for experiment tracking
+        model (nn.Module): The downstream model to be trained
+        train_loader (DataLoader): Loader for training data
+        val_loader (DataLoader): Loader for validation data
+        optimizer_config (OptimizerConfigs): Configuration dict, e.g., {"task_head_lr": 0.001}
+        criterion (nn.Module): Loss function
+        epochs (int): Number of training epochs
+        device (torch.device): Device to run training on (CPU/GPU)
+        save_dir (str): The parent directory where results will be saved
 
     Outputs:
-    model (nn.Module): The downstream model trained
+        model (nn.Module): The downstream model trained
     """
     # 1. Get the start time and create the specific run directory
     start_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
@@ -220,36 +188,25 @@ def train_downstream_model(model: nn.Module,
     with open(log_file, mode='w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(["Epoch", "Train Loss", "Validation Loss", "Learning Rate"])
-    
-    # 2. If trackio parameters are provided, initiate the tracker
-    if trackio_params:
-        trackio.init(
-            project=trackio_params["project"],
-            name=trackio_params.get("name", f"Run_{start_time}"), # Default to timestamp if no name
-            group=trackio_params.get("group", ""),
-            config=trackio_params.get("config", {}),
-            embed=False
-        )
 
-    # 3. Moves model to the device
+    # 2. Moves model to the device
     model = model.to(device)
-    # 4. Create the Optimizer
+    # 3. Create the Optimizer
     optimizer = torch.optim.Adam(model.task_head.parameters(), lr=optimizer_configs["task_head_lr"])
     
     best_val_loss = float('inf')
     trange_epochs = trange(epochs)
 
-    # 5. Start the Epoch Loop
+    # 4. Start the Epoch Loop
     for epoch in trange_epochs:
-        # 6. Training Phase
+        # 5. Training Phase
         model.train()
         train_loss = 0.0
         for batch in train_loader:
             batch_channels = batch[0].to(device)
-            batch_tokens = batch[1].to(device)
 
             optimizer.zero_grad()
-            pred = model(batch_tokens)
+            pred = model(batch_channels)
 
             loss = criterion(pred, batch_channels)
             loss.backward()
@@ -259,15 +216,14 @@ def train_downstream_model(model: nn.Module,
 
         train_loss /= len(train_loader)
 
-        # 7. Validation Phase
+        # 6. Validation Phase
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 batch_channels = batch[0].to(device)
-                batch_tokens = batch[1].to(device)
 
-                pred = model(batch_tokens)
+                pred = model(batch_channels)
 
                 loss = criterion(pred, batch_channels)
                 val_loss += loss.item()
@@ -276,26 +232,18 @@ def train_downstream_model(model: nn.Module,
 
         current_lr = optimizer.param_groups[0]['lr']
 
-        # 8. Update Progress Bar
+        # 7. Update Progress Bar
         trange_epochs.set_postfix({
             "Train Loss": train_loss, 
             "Validation Loss": val_loss,
             "LR": current_lr})
         
-        # 9. Checkpoint: Save best state dict in memory
+        # 8. Checkpoint: Save best state dict in memory
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state_dict = model.state_dict()
 
-        # 10. Log metrics to Trackio (if enabled)
-        if trackio_params:
-            trackio.log({
-                "Train loss": train_loss,
-                "Validation loss": val_loss,
-                "Learning rate": current_lr
-            })
-        # Log results
-
+        # 10. Log results
         with open(log_file, mode='a', newline='') as file:
             writer = csv.writer(file)
             writer.writerow([epoch + 1, train_loss, val_loss, current_lr])
@@ -303,10 +251,6 @@ def train_downstream_model(model: nn.Module,
     # 11. Save the best model artifact to disk
     model_path = os.path.join(run_dir, f"model_{start_time}.pth")
     torch.save(best_state_dict, model_path)
-
-    # 12. Finish the Trackio run safely
-    if trackio_params:
-        trackio.finish()
 
     return model
 
@@ -353,8 +297,7 @@ def finetune(model: nn.Module,
              epochs: int,
              warmup_epochs: int,
              device: torch.device,
-             save_dir: str,
-             trackio_params: Optional[TrackioParams] = None) -> nn.Module:
+             save_dir: str) -> nn.Module:
     """
     Finetunes a model with a warm-up phase and layer-specific learning rates.
 
@@ -363,20 +306,19 @@ def finetune(model: nn.Module,
     2. Fine-tuning: At `warmup_epochs`, specific layers are unfrozen via `model.fine_tune()`.
 
     Inputs:
-    model (nn.Module): The model to fine-tune. Must implement a `.fine_tune(n_layers)` method.
-    train_loader (DataLoader): Loader for training data.
-    val_loader (DataLoader): Loader for validation data.
-    fine_tune_layers (list or str): The number of layers to unfreeze after the warm-up phase.
-    optimizer_config (OptimizerConfigs): Dictionary containing "task_head_lr" and "encoder_lr".
-    criterion (nn.Module): Loss function.
-    epochs (int): Total number of training epochs.
-    warmup_epochs (int): Number of epochs before unfreezing layers.
-    device (torch.device): Computation device.
-    save_dir (str): Parent directory for saving results.
-    trackio_params (TrackioParams, optional): Parameters for experiment tracking.
+        model (nn.Module): The model to fine-tune. Must implement a `.fine_tune(n_layers)` method.
+        train_loader (DataLoader): Loader for training data.
+        val_loader (DataLoader): Loader for validation data.
+        fine_tune_layers (list or str): The number of layers to unfreeze after the warm-up phase.
+        optimizer_config (OptimizerConfigs): Dictionary containing "task_head_lr" and "encoder_lr".
+        criterion (nn.Module): Loss function.
+        epochs (int): Total number of training epochs.
+        warmup_epochs (int): Number of epochs before unfreezing layers.
+        device (torch.device): Computation device.
+        save_dir (str): Parent directory for saving results.
 
     Outputs:
-    model (nn.Module): The model to fine-tuned
+        model (nn.Module): The model to fine-tuned
     """
     # 1. Setup Run Directory
     start_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
@@ -388,19 +330,9 @@ def finetune(model: nn.Module,
     with open(log_file, mode='w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(["Epoch", "Train Loss", "Validation Loss", "Learning Rate - Head", "Learning Rate - Encoder"])
-
-    # 2. Initialize Trackio
-    if trackio_params:
-        trackio.init(
-            project=trackio_params["project"],
-            name=trackio_params.get("name", f"Run_{start_time}"), # Default to timestamp if no name
-            group=trackio_params.get("group", ""),
-            config=trackio_params.get("config", {}),
-            embed=False
-        )
     
     model = model.to(device)
-    # 3. Set up Optimizer with Parameter Groups
+    # 2. Set up Optimizer with Parameter Groups
     # We assign different learning rates to the Head vs the Encoder
     optimizer = torch.optim.AdamW([
         {
@@ -412,7 +344,7 @@ def finetune(model: nn.Module,
             "lr": optimizer_configs["encoder_lr"]
         }
     ])
-    # 4. Set up Scheduler
+    # 3. Set up Scheduler
     # Calculates total steps based on dataset size
     steps_per_epoch = len(train_loader)
     warmup_steps = warmup_epochs * steps_per_epoch
@@ -427,21 +359,20 @@ def finetune(model: nn.Module,
     best_val_loss = float('inf')
     trange_epochs = trange(epochs)
     for epoch in trange_epochs:
-        # 5. Unfreeze Logic
+        # 4. Unfreeze Logic
         # Trigger specific fine-tuning behavior in the model class once warm-up is done
         if epoch == warmup_epochs:
             model.fine_tune(fine_tune_layers)
         
-        # 7. Training Phase
+        # 5. Training Phase
         model.train()
         train_loss = 0.0
 
         for batch in train_loader:
             batch_channels = batch[0].to(device)
-            batch_tokens = batch[1].to(device)
 
             optimizer.zero_grad()
-            pred = model(batch_tokens)
+            pred = model(batch_channels)
 
             loss = criterion(pred, batch_channels)
             loss.backward()
@@ -453,22 +384,21 @@ def finetune(model: nn.Module,
 
         train_loss /= len(train_loader)
 
-        # 8. Training Phase
+        # 6. Training Phase
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 batch_channels = batch[0].to(device)
-                batch_tokens = batch[1].to(device)
 
-                pred = model(batch_tokens)
+                pred = model(batch_channels)
 
                 loss = criterion(pred, batch_channels)
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
 
-        # 9. Retrieve Current Learning Rates
+        # 7. Retrieve Current Learning Rates
         # param_groups[0] is task_head, [1] is encoder
         head_lr = optimizer.param_groups[0]["lr"]
         encoder_lr = optimizer.param_groups[1]["lr"]
@@ -479,29 +409,17 @@ def finetune(model: nn.Module,
             "Head LR": head_lr,
             "Encoder LR": encoder_lr})
         
-        # 10. Checkpointing
+        # 8. Checkpointing
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state_dict = model.state_dict()
-
-        # 11. Logging
-        if trackio_params:
-            trackio.log({
-                "Train loss": train_loss,
-                "Validation loss": val_loss,
-                "Learning rate - Head": head_lr,
-                "Learning rate - Encoder": encoder_lr,
-            })
         
         with open(log_file, mode='a', newline='') as file:
             writer = csv.writer(file)
             writer.writerow([epoch + 1, train_loss, val_loss, head_lr, encoder_lr])
 
-    # 12. Save Model Artifacts
+    # 9. Save Model Artifacts
     model_path = os.path.join(run_dir, f"model_{start_time}.pth")
     torch.save(best_state_dict, model_path)
-
-    if trackio_params:
-        trackio.finish()
     
     return model

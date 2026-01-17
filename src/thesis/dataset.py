@@ -123,7 +123,8 @@ class DeepMIMOGenerator:
         deepmimo_data = DeepMIMOv3.generate_data(self.params)
 
         # 2. Removes users without a path to the BS
-        idxs = np.where(deepmimo_data[0]['user']['LoS'] != -1)[0]
+        # idxs = np.where(deepmimo_data[0]['user']['LoS'] != -1)[0]
+        idxs = np.where(deepmimo_data[0]['user']['LoS'] == 1)[0]
         cleaned_deepmimo_data = deepmimo_data[0]['user']['channel'][idxs]
         # 3. Removes the UE antenna dimension
         all_channels = cleaned_deepmimo_data.squeeze()
@@ -400,112 +401,3 @@ class Tokenizer:
             tokens = tokens.view(batch_dim, user_dim, seq_len, token_dim)
 
         return tokens
-    
-class PowerAllocationDataset(Dataset):
-    """
-    Users DeepMIMO generator and Tokenizer to generate a dataset for power allocation task
-    Creates channels and tokens that are ready for the LWM model
-
-    Attributes:
-        num_samples (int): Number of samples in the dataset
-        num_users (int): Number of users in each sample
-        generator (DeepMIMOGenerator): a DeepMIMO dataset generator
-        min_corr (float): Minimum correlation between users
-        max_corr (float): Maximum correlation beween users
-        max_gain_ratio (float): Maximum gain ratio between users
-        raw_channels (torch.Tensor): The raw channel dataset [B, SC, K, N]
-        tokenizer (Tokenizer) [Optional]: Tokenizer that generates tokens for the LWM from wireless channels
-        data_tokens (torch.Tensor) [Optional]: Dataset with tokens [B, K, Sequence Length, Features]
-    """
-    def __init__(self,
-                 num_samples: int,
-                 num_users: int,
-                 min_corr: float = 0.5,
-                 max_corr: float = 0.9,
-                 max_gain_ratio: float = 20.0,
-                 scenario_name: str = "city_6_miami",
-                 bs_idx: int = 1,
-                 scenario_folder: str = "./scenarios",
-                 preprocess_tokens = True,
-                 patch_rows: int = 4,
-                 patch_cols: int = 4,
-                 cls_value: float = 0.2,
-                 scale_factor: int = 1e6):
-        """
-        Creates the dataset for Power Allocation Task
-
-        Inputs:
-            num_samples (int): Number of samples in the dataset
-            num_users (int): Number of users in each sample
-            min_corr (float): Minimum correlation between users
-            max_corr (float): Maximum correlation beween users
-            max_gain_ratio (float): Maximum gain ratio between users
-            scenario_name (str): The name of the selected scenario
-            bs_idx (int): The index of the active base station
-            scenario_folder (str): Path to to the directory with the scenarios
-            preprocess_tokens (bool): True if it should also generate tokens
-            patch_rows (int): The number of rows used in each patch
-            patch_cols (int): The number of columns used in each patch
-            cls_value (float): The value that represents the CLS token
-            scale_factor (int): The scale factor for normalization
-        """
-        super().__init__()
-
-        self.num_samples = num_samples
-        self.num_users = num_users
-
-        self.generator = DeepMIMOGenerator(
-            scenario_name=scenario_name,
-            bs_idx=bs_idx,
-            scenario_folder=scenario_folder
-        )
-
-        self.min_corr = min_corr
-        self.max_corr = max_corr
-        self.max_gain_ratio = max_gain_ratio
-        
-        raw_channels_np, _ = self.generator.generate_dataset(
-            num_samples=num_samples, 
-            num_users=num_users, 
-            min_corr=min_corr, 
-            max_corr=max_corr, 
-            max_gain_ratio=max_gain_ratio
-        )
-
-        raw_channels = torch.tensor(raw_channels_np, dtype=torch.complex64)
-
-        if preprocess_tokens:
-            self.tokenizer = Tokenizer(patch_rows=patch_rows,
-                                       patch_cols=patch_cols,
-                                       cls_value=cls_value,
-                                       scale_factor=scale_factor)
-            
-            self.data_tokens = self.tokenizer(raw_channels)
-
-        # Reshapes the raw channels from (Samples, Users, Antennas, Subcarriers) (0, 1, 2, 3)
-        # To [Samples, Subcarriers, Users, Antennas] (0, 3, 1, 2)
-        # This is the format used in the Power Allocation Solver
-        # This must be after processing the Tokens because the Tokenizer uses the same format as DeepMIMO
-        self.raw_channels = raw_channels.permute(0, 3, 1, 2)
-
-    def __len__(self) -> int:
-        return self.num_samples
-    
-    def __getitem__(self,
-                    idx:int) -> torch.Tensor:
-        """
-        Returns one sample. 
-
-        Inputs:
-            idx (int): The index of the sample
-
-        Outputs:
-            sample (torch.Tensor): Token [K, Sequence Length, Features] if preprocessed
-                                   Channel [SC, K, N] else
-        """
-        if self.preprocess_tokens:
-            # Return pre-calculated tokens
-            return self.data_tokens[idx]
-        else:
-            # Return raw channel matrix (e.g., if you want to tokenize on-the-fly)
-            return self.raw_channels[idx]

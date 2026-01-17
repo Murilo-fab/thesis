@@ -8,34 +8,18 @@ from torch.utils.data import TensorDataset, DataLoader, random_split, Subset
 import warnings
 warnings.filterwarnings("ignore", message="Length of split at index")
 
-class TrackioParams(TypedDict, total=False):
-    """
-    Type definition for Trackio configuration parameters.
-    
-    Attributes:
-    project (str): The name of the project in the dashboard.
-    name (Optional[str]): A specific name for this run (e.g., "Experiment_A").
-    tags (Optional[List[str]]): A list of tags for filtering (e.g., ["dev", "v1"]).
-    config (Optional[Dict[str, Any]]): A dictionary of hyperparameters to log.
-    """
-    project: str
-    name: Optional[str]
-    group: Optional[str]
-    config: Optional[Dict[str, Any]]
-
 class OptimizerConfigs(TypedDict):
     """
     Type definition for Optimizer configuration parameters.
 
     Attributes:
-    task_head_lr (float): Learning rate for the task-specific head.
-    encoder_lr (Optional[float]): Learning rate for the encoder (if applicable).
+        task_head_lr (float): Learning rate for the task-specific head.
+        encoder_lr (Optional[float]): Learning rate for the encoder (if applicable).
     """
     task_head_lr: float
     encoder_lr: Optional[float]
 
 def prepare_loaders(channels_tensor: torch.Tensor,
-                    tokens_tensor: torch.Tensor,
                     split: List[float] = [0.7, 0.2, 0.1],
                     batch_size: int = 32,
                     seed: int = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -43,17 +27,17 @@ def prepare_loaders(channels_tensor: torch.Tensor,
     Creates a train, validation and test loader;
 
     Inputs:
-    channels_tensor (torch.Tensor): The raw input features (channels).
-    tokens_tensor (torch.Tensor): The raw target labels (tokens).
-    split (List[float]): The split ratios for [train, val, test]. Must sum to 1.0.
-    batch_size (int): The number of samples per batch.
-    seed (int, optional): Random seed for reproducibility.
+        channels_tensor (torch.Tensor): The raw input features (channels).
+        tokens_tensor (torch.Tensor): The raw target labels (tokens).
+        split (List[float]): The split ratios for [train, val, test]. Must sum to 1.0.
+        batch_size (int): The number of samples per batch.
+        seed (int, optional): Random seed for reproducibility.
 
     Outputs:
-    Tuple[DataLoader, DataLoader, DataLoader]: The train, validation, and test loaders.
+        Tuple[DataLoader, DataLoader, DataLoader]: The train, validation, and test loaders.
     """
     # 1. Create a TensorDataset wrapping the inputs and targets
-    base_dataset = TensorDataset(channels_tensor, tokens_tensor)
+    base_dataset = TensorDataset(channels_tensor)#, tokens_tensor)
     
     # 2. Define the generator for reproducibility
     if seed is not None:
@@ -91,13 +75,13 @@ def get_subset(data_loader: DataLoader,
     Returns a new DataLoader containing a random fraction of the original data.
 
     Inputs:
-    data_loader (DataLoader): The original source DataLoader.
-    ratio (float): The fraction of data to keep (0.0 to 1.0).
-    batch_size (int, optional): The batch size for the new loader. Defaults to original.
-    seed (int, optional): Random seed for selecting indices.
+        data_loader (DataLoader): The original source DataLoader.
+        ratio (float): The fraction of data to keep (0.0 to 1.0).
+        batch_size (int, optional): The batch size for the new loader. Defaults to original.
+        seed (int, optional): Random seed for selecting indices.
 
     Outputs:
-    DataLoader: A new DataLoader containing the sampled subset.
+        DataLoader: A new DataLoader containing the sampled subset.
     """
     # 1. Access the underlying dataset
     dataset = data_loader.dataset
@@ -131,12 +115,12 @@ def clone_scenarios(scenario_name: str,
     This avoids downloading the entire dataset history, fetching only the requested scenario folder.
 
     Inputs:
-    scenario_name (str): The name of the specific scenario folder to clone (e.g., "O1_60").
-    repo_url (str): The URL of the Git repository.
-    base_dir (str): The local directory where the 'scenarios' folder will be created.
+        scenario_name (str): The name of the specific scenario folder to clone (e.g., "O1_60").
+        repo_url (str): The URL of the Git repository.
+        base_dir (str): The local directory where the 'scenarios' folder will be created.
 
     Outputs:
-    None
+        None
     """
     # 1. Setup paths
     scenarios_path = os.path.join(base_dir, "scenarios")
