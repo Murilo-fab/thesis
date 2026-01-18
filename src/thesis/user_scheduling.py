@@ -2,47 +2,62 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-def generate_labels(channels, patch_cols, mode="proportional_fair", noise_variance: float=1e-3):
-    """
-    Generates ground truth labels for the carrier allocation task.
+class JointUtilityLoss(nn.Module):
+    def __init__(self, alpha_entropy=0.01, alpha_power=0.001, noise_var=1e-9):
+        super().__init__()
+        self.alpha_entropy = alpha_entropy
+        self.alpha_power = alpha_power
+        self.noise_var = noise_var
 
-    Inputs:
-        channels: Complex channel matrix - (Batch, Users, M, SC)
-        patch_cols: The number of carriers in the allocation block
-        mode: "greedy", "round_robin", "proportional_fair"
-        noise_variance: Noise variance
+    def forward(self, assignment_probs, power_values, channels):
+        """
+        Args:
+            assignment_probs: (Batch, Users, Blocks) - Model Decision
+            power_values:     (Batch, Users, Blocks) - Model Decision
+            channels:         (Batch, Users, Ant, SC) - Real Physics
+        """
+        B, K, M, SC = channels.shape
+        _, _, Blocks = assignment_probs.shape
+        
+        # 1. The Mapping Problem: Blocks -> Subcarriers
+        # We need to stretch the model's decision to match the physical subcarriers
+        subcarriers_per_block = SC // Blocks
+        
+        # Expand: (B, K, Blocks) -> (B, K, Blocks, SC_per_Block) -> (B, K, SC)
+        A_full = assignment_probs.repeat_interleave(subcarriers_per_block, dim=2)
+        P_full = power_values.repeat_interleave(subcarriers_per_block, dim=2) / subcarriers_per_block
+        
+        # 2. Physics: Handle Antennas (M)
+        # Shape: (B, K, SC)
+        channel_gains_full = torch.sum(torch.abs(channels)**2, dim=2)
+        
+        # 3. Calculate REAL SINR (Per Subcarrier)
+        # Signal = P_sc * Gain_sc
+        signal_power = P_full * channel_gains_full
+        
+        # Interference (Per Subcarrier)
+        # Total power on this subcarrier from ALL users
+        total_power_on_sc = torch.sum(signal_power, dim=1, keepdim=True)
+        interference = total_power_on_sc - signal_power
+        
+        # SINR
+        sinr = signal_power / (interference + self.noise_var)
+        
+        # 4. Calculate Rate (Per Subcarrier)
+        # Rate = A * log(1 + SINR)
+        weighted_rate = A_full * torch.log2(1 + sinr)
+        
+        # 5. Loss
+        # Utility
+        total_sum_rate = torch.sum(weighted_rate, dim=(1,2))
+        loss_utility = -torch.mean(total_sum_rate)
 
-    Outputs:
-        labels: The winning user index - (Batch, Num_blocks)
-    
-    """
-    B, K, M, SC = channels.shape
-    num_blocks = SC // patch_cols
-    device = channels.device
+        # Entropy
+        entropy = -torch.sum(assignment_probs * torch.log(assignment_probs + 1e-8), dim=(1,2))
+        loss_entropy = torch.mean(entropy)
 
-    # 1. Calculate block SNR
-    mag_sq = torch.abs(channels)**2
-
-    # Spatial average
-    gain_freq = torch.mean(mag_sq, dim=2)
-
-    gain_reshaped = gain_freq.view(B, K, num_blocks, patch_cols)
-    block_gains = torch.mean(gain_reshaped, dim=3)
-
-    block_snrs = block_gains / noise_variance
-
-    if mode == "greedy":
-        labels = torch.argmax(block_snrs, dim=1)
-    elif mode == "round_robin":
-        indices = torch.arange(num_blocks, device=device) % K
-        labels = indices.expand(B, -1)
-    elif mode == "proportional_fair":
-        user_average_snr = torch.mean(block_snrs, dim=2, keepdim=True)
-
-        pf_metric = block_snrs / (user_average_snr + 1e-8)
-
-        labels = torch.argmax(pf_metric, dim=1)
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-    
-    return labels
+        # Power regularization
+        power_reg = torch.sum(power_values**2, dim=(1,2))
+        loss_power = torch.mean(power_reg)
+        
+        return loss_utility + (self.alpha_entropy * loss_entropy) + (self.alpha_power * loss_power)

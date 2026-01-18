@@ -169,7 +169,65 @@ class Wrapper(nn.Module):
 
         return power_weights
     
-class CarrierAllocation(nn.Module):
+class AssignmentHead(nn.Module):
+    def __init__(self, emb_dim=128, hidden_dim=64):
+        super().__init__()
+
+        # MLP Net
+        # Input: (Batch, Users, Num_Blocks, Emb_dim)
+        # Output: (Batch, User, Num_Blocks, 1)
+        self.net = nn.Sequential(
+            nn.Linear(emb_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    
+    def forward(self, user_embeddings, temperature=1.0):
+        scores = self.net(user_embeddings)
+        scores = scores.squeeze(-1)
+        scaled_scores = scores / temperature
+        assignment_probs = F.softmax(scaled_scores, dim=1)
+
+        return assignment_probs
+    
+class PowerAllocationHead(nn.Module):
+    def __init__(self, embed_dim=128, hidden_dim=64, total_power=1.0):
+        super().__init__()
+        self.total_power = total_power
+        
+        # Increase input dimension to include assignment probability
+        input_dim = embed_dim + 1 
+        
+        self.power_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 1), 
+            nn.Sigmoid() # Raw "scores" in [0,1]
+        )
+
+    def forward(self, embeddings, assignment_probs):
+        # 1. Prepare Input
+        probs_expanded = assignment_probs.unsqueeze(-1)
+        x = torch.cat([embeddings, probs_expanded], dim=-1)
+        
+        # 2. Predict Raw Scores
+        raw_scores = self.power_net(x).squeeze(-1) + 1e-9
+        
+        # 3. FORCE FULL POWER USAGE (Softmax-style normalization)
+        # Sum of scores per sample
+        total_score = torch.sum(raw_scores, dim=(1, 2), keepdim=True)
+        
+        # Normalize: fractions always sum to 1.0
+        power_fractions = raw_scores / total_score
+        
+        # Scale to Budget
+        allocated_power = power_fractions * self.total_power
+        
+        return allocated_power
+    
+class WrapperAllocation(nn.Module):
     def __init__(self, tokenizer, encoder, assignment_head, allocation_head, emb_dim: int = 128):
         """
         Wrapper for the Carrier Selection Task

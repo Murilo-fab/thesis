@@ -147,21 +147,38 @@ def clone_scenarios(scenario_name: str,
 
     print(f"Successfully cloned {scenario_name} into {scenario_path}.")
 
-def calculate_noise_power(bandwidth_ghz, noise_figure_db=9):
+def calculate_noise_variance(channels, target_snr_db=5.0, mode='edge', percentile=0.05):
     """
-    Calculates noise variance (sigma^2) in linear scale (Watts).
+    Calculates the noise variance required to achieve a specific SNR target.
+    
+    Args:
+        channels: (Batch, Users, M, SC) Complex tensor
+        target_snr_db: Desired SNR in decibels (e.g., 5.0)
+        mode: 'mean' (targets average user) or 'edge' (targets weak users)
+        percentile: The cutoff for 'edge' mode (default 0.05 = 5th percentile)
+        
+    Returns:
+        noise_variance: float
     """
-    k_B = 1.380649e-23  # Boltzmann constant
-    T = 290             # Temperature (Kelvin)
-    BW_Hz = bandwidth_ghz * 1e9 # Convert GHz to Hz
+    # 1. Calculate Signal Power per User
+    # Shape: (Batch, Users)
+    user_powers = torch.mean(torch.abs(channels)**2, dim=(2, 3))
     
-    # Thermal Noise Density (N0)
-    noise_spectral_density = k_B * T 
+    # Flatten to see the global distribution of all users in the batch
+    all_powers = user_powers.flatten()
     
-    # Noise Figure in Linear Scale
-    noise_figure_linear = 10 ** (noise_figure_db / 10)
+    # 2. Determine Reference Signal Power
+    if mode == 'mean':
+        ref_power = torch.mean(all_powers).item()
+        
+    elif mode == 'edge':
+        ref_power = torch.quantile(all_powers, percentile).item()
+        
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+        
+    # 3. Calculate Required Noise    
+    target_snr_linear = 10 ** (target_snr_db / 10.0)
+    noise_variance = ref_power / target_snr_linear
     
-    # Total Noise Power
-    noise_power_watts = noise_spectral_density * BW_Hz * noise_figure_linear
-    
-    return noise_power_watts
+    return noise_variance
