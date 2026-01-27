@@ -67,13 +67,13 @@ def scenario_prop():
         'n_subcarriers': 512
     },
     'city_11_santaclara': {
-        'n_rows': 117,
+        'n_rows': 46,
         'n_per_row': 285,
         'n_ant_bs': 32,
         'n_subcarriers': 32
     },
     'city_12_fortworth': {
-        'n_rows': 214,
+        'n_rows': 85,
         'n_per_row': 179,
         'n_ant_bs': 32,
         'n_subcarriers': 64
@@ -91,7 +91,7 @@ def scenario_prop():
         'n_subcarriers': 256
     },
     'city_15_indianapolis': {
-        'n_rows': 200,
+        'n_rows': 79,
         'n_per_row': 196,
         'n_ant_bs': 64,
         'n_subcarriers': 32
@@ -109,13 +109,13 @@ def scenario_prop():
         'n_subcarriers': 128
     },
     'city_18_denver': {
-        'n_rows': 212,
+        'n_rows': 84,
         'n_per_row': 204,
         'n_ant_bs': 128,
         'n_subcarriers': 32
     },
     'city_19_oklahoma': {
-        'n_rows': 204,
+        'n_rows': 81,
         'n_per_row': 188,
         'n_ant_bs': 128,
         'n_subcarriers': 64

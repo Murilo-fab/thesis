@@ -1,12 +1,64 @@
 import os
 import subprocess
-from typing import TypedDict, List, Dict, Any, Optional, Tuple
+from typing import TypedDict, Optional
 
 import torch
-from torch.utils.data import TensorDataset, DataLoader, random_split, Subset
+from torch.utils.data import TensorDataset, DataLoader, Subset
+
+import DeepMIMOv3
+import numpy as np
+from thesis.scenario_props import *
 
 import warnings
 warnings.filterwarnings("ignore", message="Length of split at index")
+
+def get_parameters(scenario):
+    """ Helper to get robust DeepMIMO parameters """
+    # Default Configs
+    N_ANT = 32
+    N_SUB = 32
+    SCS = 30e3
+    DEFAULT_NUM_PATHS = 20
+
+
+    # 1. Retrieves scenario-specific properties (e.g., antenna counts)
+    scenario_configs = scenario_prop()
+
+    # 2. Start with default DeepMIMO parameters
+    params = DeepMIMOv3.default_params()
+
+    # 3. Basic configuration
+    params['dataset_folder'] = './scenarios'
+    params['scenario'] = scenario.split("_v")[0]
+
+    # BS Selection Logic
+    if scenario in ['city_18_denver', 'city_15_indianapolis']:
+        params['active_BS'] = np.array([3])
+    else:
+        params['active_BS'] = np.array([1])
+
+    params['enable_BS2BS'] = False
+    params['num_paths'] = DEFAULT_NUM_PATHS
+
+    n_ant_bs = N_ANT
+    n_subcarriers = N_SUB
+    scs = SCS
+    
+    params['bs_antenna']['shape'] = np.array([n_ant_bs, 1]) 
+    params['bs_antenna']['rotation'] = np.array([0,0,-135])
+    params['ue_antenna']['shape'] = np.array([1, 1])
+    
+    # 4. Scenario-specific configuration
+    max_rows = scenario_configs.get(scenario, {'n_rows': 50})['n_rows']
+    params['user_rows'] = np.arange(max_rows)
+    
+    # 5. OFDM configuration
+    
+    params['OFDM']['subcarriers'] = n_subcarriers
+    params['OFDM']['selected_subcarriers'] = np.arange(n_subcarriers)
+    params['OFDM']['bandwidth'] = scs * n_subcarriers / 1e9
+    
+    return params
 
 class OptimizerConfigs(TypedDict):
     """
@@ -19,92 +71,63 @@ class OptimizerConfigs(TypedDict):
     task_head_lr: float
     encoder_lr: Optional[float]
 
-def prepare_loaders(channels_tensor: torch.Tensor,
-                    split: List[float] = [0.7, 0.2, 0.1],
-                    batch_size: int = 32,
-                    seed: int = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
+def create_dataloaders(inputs, labels=None, train_ratio=0.8, val_ratio=0.2, batch_size=32, seed=42):
     """
-    Creates a train, validation and test loader;
-
-    Inputs:
-        channels_tensor (torch.Tensor): The raw input features (channels).
-        tokens_tensor (torch.Tensor): The raw target labels (tokens).
-        split (List[float]): The split ratios for [train, val, test]. Must sum to 1.0.
-        batch_size (int): The number of samples per batch.
-        seed (int, optional): Random seed for reproducibility.
-
-    Outputs:
-        Tuple[DataLoader, DataLoader, DataLoader]: The train, validation, and test loaders.
-    """
-    # 1. Create a TensorDataset wrapping the inputs and targets
-    base_dataset = TensorDataset(channels_tensor)#, tokens_tensor)
+    Splits data into Train/Val sets and creates DataLoaders.
+    Supports partial usage (e.g., using only 1% of data for training).
     
-    # 2. Define the generator for reproducibility
-    if seed is not None:
-        generator = torch.Generator().manual_seed(seed)
-    else:
-        generator = torch.Generator() # Default generator
-
-    # 3. Calculate lengths based on ratios
-    # random_split requires integer lengths, not float ratios
-    total_len = len(base_dataset)
-    lengths = [int(r * total_len) for r in split]
+    Args:
+        inputs (Tensor): Input features (e.g., Channel Matrices).
+        labels (Tensor, optional): Targets (e.g., LoS/NLoS). Can be None for unsupervised.
+        train_ratio (float): Fraction of TOTAL data to use for Training (0.0 to 1.0).
+        val_ratio (float): Fraction of TOTAL data to use for Validation.
+        batch_size (int): Batch size for loaders.
+        seed (int): Random seed for reproducible splitting.
+        
+    Returns:
+        train_loader, val_loader
+    """
+    total_samples = len(inputs)
     
-    # Fix rounding errors: Add the remainder to the first split (train) to ensure sum matches total
-    lengths[0] += total_len - sum(lengths)
-
-    # 4. Perform the split
-    if seed is not None:
-         train_subset, val_subset, test_subset = random_split(base_dataset, lengths, generator=generator)
+    # 1. Validation Check
+    if train_ratio + val_ratio > 1.0:
+        raise ValueError(f"Ratios sum to {train_ratio + val_ratio:.2f}, which exceeds 1.0")
+        
+    # 2. Determine Split Sizes
+    n_train = int(total_samples * train_ratio)
+    n_val = int(total_samples * val_ratio)
+    
+    # 3. Shuffle Indices (Reproducible)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    indices = torch.randperm(total_samples, generator=g)
+    
+    # 4. Slice Indices
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train : n_train + n_val]
+    # The rest (indices[n_train + n_val:]) are effectively discarded
+    
+    # 5. Create Subsets
+    x_train = inputs[train_idx]
+    x_val = inputs[val_idx]
+    
+    if labels is not None:
+        y_train = labels[train_idx]
+        y_val = labels[val_idx]
+        
+        # Create Datasets with Labels
+        train_ds = TensorDataset(x_train, y_train)
+        val_ds = TensorDataset(x_val, y_val)
     else:
-         train_subset, val_subset, test_subset = random_split(base_dataset, lengths)
-
-    # 5. Create DataLoaders
-    # Train is shuffled, validation/test are not
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
-
-    return train_loader, val_loader, test_loader
-
-def get_subset(data_loader: DataLoader,
-               ratio: float,
-               batch_size: Optional[int] = None,
-               seed: Optional[int] = None) -> DataLoader:
-    """
-    Returns a new DataLoader containing a random fraction of the original data.
-
-    Inputs:
-        data_loader (DataLoader): The original source DataLoader.
-        ratio (float): The fraction of data to keep (0.0 to 1.0).
-        batch_size (int, optional): The batch size for the new loader. Defaults to original.
-        seed (int, optional): Random seed for selecting indices.
-
-    Outputs:
-        DataLoader: A new DataLoader containing the sampled subset.
-    """
-    # 1. Access the underlying dataset
-    dataset = data_loader.dataset
-    n_samples = len(dataset)
-    n_subset = max(1, int(ratio * n_samples))
-
-    # 2. Determine indices for the subset
-    generator = torch.Generator()
-    if seed is not None:
-        generator.manual_seed(seed)
-
-    # Random permutation of indices, taking the first n_subset
-    indices = torch.randperm(n_samples, generator=generator)[:n_subset]
-    subset = Subset(dataset, indices)
-
-    # 3. Determine batch size (use new one or fallback to original)
-    final_batch_size = batch_size if batch_size is not None else data_loader.batch_size
-
-    # 4. Return new loader
-    return DataLoader(subset,
-                      batch_size=final_batch_size,
-                      shuffle=True)
-
+        # Create Datasets without Labels (for Unsupervised AE)
+        train_ds = TensorDataset(x_train)
+        val_ds = TensorDataset(x_val)
+        
+    # 6. Create Loaders
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    
+    return train_dl, val_dl
 
 def clone_scenarios(scenario_name: str,
                     repo_url: str,
@@ -147,38 +170,123 @@ def clone_scenarios(scenario_name: str,
 
     print(f"Successfully cloned {scenario_name} into {scenario_path}.")
 
-def calculate_noise_variance(channels, target_snr_db=5.0, mode='edge', percentile=0.05):
+def normalize_channels(x_complex):
     """
-    Calculates the noise variance required to achieve a specific SNR target.
-    
-    Args:
-        channels: (Batch, Users, M, SC) Complex tensor
-        target_snr_db: Desired SNR in decibels (e.g., 5.0)
-        mode: 'mean' (targets average user) or 'edge' (targets weak users)
-        percentile: The cutoff for 'edge' mode (default 0.05 = 5th percentile)
-        
-    Returns:
-        noise_variance: float
+    Normalizes the (B, 32, 32) complex tensor.
     """
-    # 1. Calculate Signal Power per User
-    # Shape: (Batch, Users)
-    user_powers = torch.mean(torch.abs(channels)**2, dim=(2, 3))
+    # 1. View as floats to get global mean/std of the signal
+    # (B, 32, 32) complex -> (B, 32, 32, 2) real -> flat
+    all_values = torch.view_as_real(x_complex)
+    mean = all_values.mean()
+    std = all_values.std()
+
+    # 2. Apply Normalization directly to Complex Tensor
+    x_norm = (x_complex - mean) / (std + 1e-9)
     
-    # Flatten to see the global distribution of all users in the batch
-    all_powers = user_powers.flatten()
+    return x_norm
+
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
+
+@dataclass
+class ModelConfig:
+    name: str
+    encoder_type: str
+
+    task_type: str
+    latent_dim: int
     
-    # 2. Determine Reference Signal Power
-    if mode == 'mean':
-        ref_power = torch.mean(all_powers).item()
-        
-    elif mode == 'edge':
-        ref_power = torch.quantile(all_powers, percentile).item()
-        
+    weights_path: Optional[str] = None
+    # freeze_encoder: bool = True
+    
+    # Extra args for specific wrappers (e.g., tokenizer for LWM)
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+    
+    # Head configuration (e.g., num_classes=2)
+    head_args: Dict[str, Any] = field(default_factory=lambda: {"num_classes": 2})
+
+import torch
+
+from thesis.csi_autoencoder import *
+from thesis.lwm_model import * 
+from thesis.downstream_models import *
+
+
+def build_model_from_config(config: ModelConfig):
+    """
+    Factory function that instantiates a model based on the provided configuration.
+    """
+    # 1. Build task head
+    input_dim = config.head_args['input_size']
+    num_classes = config.head_args.get('num_classes', 2)
+    
+    if config.task_type == "classification":
+        task_head = ClassificationHead(input_dim, num_classes)
+    elif config.task_type == "regression":
+        # Regression: Output 1 value, usually no softmax
+        task_head = ClassificationHead(input_dim, 1) 
     else:
-        raise ValueError(f"Unknown mode: {mode}")
-        
-    # 3. Calculate Required Noise    
-    target_snr_linear = 10 ** (target_snr_db / 10.0)
-    noise_variance = ref_power / target_snr_linear
+        return None
+
+    # 2. Build backbone & wrap
     
-    return noise_variance
+    # Case A: Autoencoder
+    if config.encoder_type == "AE":
+        # Instantiate Base Architecture
+        backbone = CSIAutoEncoder(latent_dim=config.latent_dim)
+        
+        # Load Weights (if provided, otherwise it's a Raw/Random AE)
+        if config.weights_path:
+            backbone.load_weights(config.weights_path)
+
+        # Wrap
+        model = CSIAEWrapper(
+            csi_ae_model=backbone, 
+            task_head=task_head
+        )
+
+    # Case B: LWM
+    elif config.encoder_type == "LWM":
+        # Configs
+        tokenizer = Tokenizer(patch_rows=4, patch_cols=4, scale_factor=1e0)
+        
+        if config.weights_path:
+            backbone = lwm.from_pretrained(config.weights_path)
+        else:
+            backbone = lwm()
+
+        # Wrap
+        model = LWMWrapper(
+            tokenizer=tokenizer,
+            lwm_model=backbone,
+            task_head=task_head,
+            mode=config.extra_args.get("lwm_mode", "cls"),
+        
+        )
+
+        fine_tune_layers = config.extra_args.get("fine_tune_layers")
+
+        if fine_tune_layers:
+            model.unfreeze_layers(fine_tune_layers)
+
+    # Case C: Raw Data
+    elif config.encoder_type is None:
+        # No backbone, just the head operating on flattened data
+        # We use a simple wrapper to handle flattening if needed
+        class LinearWrapper(torch.nn.Module):
+            def __init__(self, head):
+                super().__init__()
+                self.head = head
+            def forward(self, x):
+                # Flatten (Batch, 32, 32) -> (Batch, 2048)
+                if x.ndim > 2:
+                    x = torch.hstack((x.real, x.imag)).flatten(start_dim=1)
+                return self.head(x)
+                
+        model = LinearWrapper(task_head)
+
+    else:
+        raise ValueError(f"Unknown encoder_type: {config.encoder_type}")
+
+    return model
+

@@ -130,9 +130,18 @@ class lwm(nn.Module):
     def from_pretrained(cls, ckpt_name='model_weights.pth', device='cuda'):
         model = cls().to(device)
         state_dict = torch.load(ckpt_name, map_location=device)
-        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict)
-        print(f"Model loaded successfully from {ckpt_name}")
+        
+        # Robust Key Cleaning
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace("module.", "")
+            new_state_dict[new_key] = v
+            
+        missing, unexpected = model.load_state_dict(new_state_dict, strict=True)
+        
+        if missing or unexpected:
+            print(f"Model loaded. Missing keys: {missing}, Unexpected: {unexpected}")
+            
         return model
 
     def forward(self, input_ids, masked_pos=None):
@@ -154,3 +163,251 @@ class lwm(nn.Module):
             return logits_lm, output, attention_maps
         else:
             return output, attention_maps
+
+"""
+This script defined below was created by me.
+
+@author: Murilo Ferreira Alves Batista
+"""
+
+class Tokenizer:
+    """
+    A Tokenizer that generates tokens for the LWM from wireless channels
+
+    Attributes:
+        patch_rows (int): The number of rows used in each patch
+        patch_cols (int): The number of columns used in each patch
+        cls_value (float): The value that represents the CLS token
+        scale_factor (int): The scale factor for normalization
+    """
+    def __init__(self,
+                 patch_rows: int,
+                 patch_cols: int,
+                 cls_value: float = 0.2,
+                 scale_factor: int = 1e6):
+        """
+        Constrcutor of the tokenizer
+
+        Inputs:
+            patch_rows (int): The number of rows used in each patch
+            patch_cols (int): The number of columns used in each patch
+            cls_value (float): The value that represents the CLS token
+            scale_factor (int): The scale factor for normalization
+        """
+        self.patch_rows = patch_rows
+        self.patch_cols = patch_cols
+        self.cls_value = cls_value
+        self.scale_factor = scale_factor
+
+    def patching(self,
+                 x_complex: torch.Tensor) -> torch.Tensor:
+        """
+        Generates patches from the complex channels
+        
+        Inputs:
+            x_complex (torch.Tensor): The complex wireless channel [B, M, N, SC] or [B, N, SC]
+
+        Outputs:
+            patches (torch.Tensor): The final patches [B, Patches, Features]
+        """
+        # Step 1: Dimension check
+        # Remove Singleton dimension - Currently, the LWM model uses only one antenna in the UE
+        if x_complex.ndim == 4:
+            x_complex = x_complex[:, 0, :, :]
+
+        batch_size, n_rows, n_cols = x_complex.shape
+
+        # Step 2: Split into real and imaginary parts and interleave them
+        x_real = x_complex.real
+        x_imag = x_complex.imag
+        x_interleaved = torch.stack((x_real, x_imag), dim=-1).flatten(start_dim=2)
+
+        # 3. Calculate Padding
+        current_rows = x_interleaved.shape[1]
+        current_cols = x_interleaved.shape[2]
+        patch_width_flat = self.patch_cols * 2 # Real+Imag width
+
+        pad_rows = (self.patch_rows - (current_rows % self.patch_rows)) % self.patch_rows
+        pad_cols = (patch_width_flat - (current_cols % patch_width_flat)) % patch_width_flat
+
+        # 4. Apply Padding
+        if pad_rows > 0 or pad_cols > 0:
+            x_interleaved = F.pad(x_interleaved, (0, pad_cols, 0, pad_rows), value=0)
+
+        # 5. Unfold (Create Patches)
+        # Shape: (B, n_pr, Width, h)
+        patches = x_interleaved.unfold(dimension=1, size=self.patch_rows, step=self.patch_rows)
+        # Shape: (B, n_pr, n_pc, h, w)
+        patches = patches.unfold(dimension=2, size=patch_width_flat, step=patch_width_flat)
+
+        # 6. Flatten to Sequence
+        # Permute to (B, n_pr, n_pc, h, w)
+        # We need to keep this permutation logic consistent for folding back
+        patches = patches.contiguous()
+
+        # 7. Flatten grid (n_pr, n_pc) into Num_Patches
+        patches = patches.flatten(start_dim=1, end_dim=2)
+
+        # 8. Flatten pixels (h, w) into Features
+        patches = patches.flatten(start_dim=2)
+
+        return patches
+    
+    def tokenizing(self,
+                   patches: torch.Tensor) -> torch.Tensor:
+        """
+        Generates tokens used in the LWM from tokens.
+        Basically, prepends a CLS token in the beginning of the token sequence
+
+        Inputs:
+            patches (torch.Tensor): The patches used to produce tokens [B, Patches, Features]
+
+        Outputs:
+            tokens (torch.Tensor): The sequence of tokens [B, Sequence Length, Features]
+        """
+        batch_size = patches.shape[0]
+        features = patches.shape[-1]
+        device = patches.device
+
+        # 1. Create CLS token batch
+        cls_tokens = torch.full(
+            (batch_size, 1, features), 
+            self.cls_value, 
+            device=device, 
+            dtype=patches.dtype
+        )
+
+        # 2. Prepend CLS
+        return torch.cat([cls_tokens, patches], dim=1)
+    
+    def __call__(self,
+                 x_complex: torch.Tensor) -> torch.Tensor:
+        """
+        Transform the complex wireless channel into a sequence of tokens and multiplies for normalization.
+        
+        Inputs:
+            x_complex (torch.Tensor): The complex wireless channel [B, K, N, SC] or [B, N, SC]
+
+        Outputs:
+            tokens (torch.Tensor): The sequence of tokens [B, K, Sequence Length, Features] or [B, Sequence Length, Features]
+        """
+        input_ndim = x_complex.ndim 
+        x_complex = x_complex * self.scale_factor # Scale factor for LWM
+        # 1. Handle dimensions
+        if input_ndim == 4:
+            # Case A: (Batch, Users, M, S)
+            batch_dim, user_dim, n_rows, n_cols = x_complex.shape
+            # Flatten Batch and User together for processing
+            # New shape: (B*Users, M, S)
+            x_processing = x_complex.reshape(-1, n_rows, n_cols)
+
+        elif input_ndim == 3:
+            # Case B: (Batch, M, S)
+            x_processing = x_complex 
+        else:
+            raise ValueError(f"Expected 3D or 4D input, got {x_complex.shape}")
+        # 2. Process
+        patches = self.patching(x_processing)
+        tokens = self.tokenizing(patches)
+        # 3. Restore original shape
+        if input_ndim == 4:
+            # Un-flatten (Batch*Users) -> (Batch, Users)
+            # Current: (Batch*Users, Sequence, Dim)
+            # New shape: (Batch, Users, Sequence, Dim)
+            seq_len = tokens.shape[1]
+            token_dim = tokens.shape[2]
+
+            tokens = tokens.view(batch_dim, user_dim, seq_len, token_dim)
+
+        return tokens
+
+class LWMWrapper(nn.Module):
+    def __init__(self, tokenizer, lwm_model, task_head, mode="cls"):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.lwm = lwm_model
+        self.task_head = task_head
+        self.mode = mode
+
+        for param in self.lwm.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_layers(self, fine_tune_layers):
+        """
+        Selectively unfreezes layers in the LWM backbone.
+        
+        Args:
+            fine_tune_layers: "full" (all layers) OR list of strings (e.g. ["layers.10", "layers.11"])
+        """
+        # We target self.lwm for unfreezing
+        model_ref = self.lwm
+        
+        if fine_tune_layers == "full":
+            print("Unfreezing all LWM layers.")
+            for param in model_ref.parameters():
+                param.requires_grad = True
+        else:
+            # Get available layer names for validation
+            available_layers = [name for name, _ in model_ref.named_parameters()]
+            
+            # Validate requests
+            for layer_req in fine_tune_layers:
+                if not any(layer_req in lname for lname in available_layers):
+                    raise ValueError(
+                        f"Layer substring '{layer_req}' not found in LWM model.\n"
+                        f"Example available layers: {available_layers[:3]}..."
+                    )
+            
+            # Perform selective unfreezing
+            print(f"Unfreezing LWM layers matching: {fine_tune_layers}")
+            for name, param in model_ref.named_parameters():
+                if any(layer_req in name for layer_req in fine_tune_layers):
+                    param.requires_grad = True
+
+    def forward(self, x):
+        """
+        Args:
+            x: Can be (Batch, 32, 32) OR (Batch, K_Users, 32, 32)
+        Returns:
+            (Batch, Dim) OR (Batch, K_Users, Dim)
+        """
+        # 1. Shape handling
+        if x.ndim == 4: # Input is (Batch, K, 32, 32)
+            B, K, M, N = x.shape
+            # Flatten Batch and K to process in parallel: (B*K, 32, 32)
+            tokenizer_input = x.view(B*K, M, N)
+        else:
+            tokenizer_input = x
+
+        # 2. Tokenizer
+        # (Total_Batch, Seq, element_length)
+        tokens = self.tokenizer(tokenizer_input)
+        
+        # 3. LWM forward pass
+        # embeddings: (Total_Batch, Seq_Len, d_model)
+        embeddings, _ = self.lwm(tokens)
+        
+        # 4. Extract features
+        if self.mode == "cls":
+            # Take CLS token: (Total_Batch, d_model)
+            features = embeddings[:, 0, :]
+        elif self.mode == "channel_emb":
+            # Take Channel tokens: (Total_Batch, (Seq_Len-CLS)*d_model)
+            features = embeddings[:, 1:, :].flatten(start_dim=1)
+        elif self.mode == "combined":
+            # All tokens: (Total_Batch, Seq_Len*d_model)
+            features = embeddings.flatten(start_dim=1)
+        elif self.mode == "mean_pooled":
+            # Mean pooled: (Total_Batch, Dim)
+            features = torch.mean(embeddings, dim=1).unsqueeze(1) 
+        else:
+            raise ValueError(f"Invalid LWM mode: {self.mode}")
+
+        # 5. Restore multi-user shape
+        if x.ndim == 4:
+            # (B, K, Dim)
+            features = features.view(B, K, -1)
+
+        out = self.task_head(features)
+            
+        return out
