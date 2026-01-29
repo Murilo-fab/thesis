@@ -150,7 +150,7 @@ def train_downstream(
     os.makedirs(results_folder, exist_ok=True)
     log_file = os.path.join(results_folder, f"training_log_{run_name}.csv")
 
-    headers = ["Epoch", "Train Loss", "Validation Loss", "Val F1", "Learning Rate", "Time(s)"]
+    headers = ["Epoch", "Train Loss", "Validation Loss", "Val F1", "Time(s)"]
 
     with open(log_file, mode='w', newline='') as file:
         writer = csv.writer(file)

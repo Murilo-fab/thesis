@@ -405,8 +405,9 @@ class LWMWrapper(nn.Module):
 
         # 5. Restore multi-user shape
         if x.ndim == 4:
-            # (B, K, Dim)
-            features = features.view(B, K, -1)
+           # (B, K, Dim)
+            # features = features.view(B, K, -1)
+            features = features.reshape(B, -1)
 
         out = self.task_head(features)
             

@@ -167,11 +167,12 @@ class CSIAEWrapper(nn.Module):
         if x.ndim == 4:
             B, K, M, N = x.shape
             # Flatten to (B*K, M, N) for the standard Encoder
-            features = features.view(B, K, -1)
+            # features = features.view(B, K, -1)
+            features = features.view(B, -1)
 
         # 4. Task Head
         out = self.task_head(features)
-        
+
         return out
     
 @dataclass

@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 # Telecommunication imports
 import DeepMIMOv3
 from thesis.scenario_props import *
+from thesis.utils import get_parameters
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -36,8 +37,7 @@ class DeepMIMOGenerator:
     """
     def __init__(self,
                  scenario_name: str = 'city_6_miami',
-                 bs_idx: int = 1,
-                 scenario_folder: str = "./scenarios"):
+                 scale_factor: float = 1e6):
         """
         Initialize the DeepMIMO dataset generator.
         Generates the channels, gains and normalized center carrier.
@@ -48,64 +48,14 @@ class DeepMIMOGenerator:
             scenario_folder (str): Path to to the directory with the scenarios
         """
         self.scenario_name = scenario_name
-        self.bs_idx = bs_idx
-        self.scenario_folder = scenario_folder
-        self.params, self.n_subcarriers, self.n_ant_bs = self.get_parameters(scenario_name, bs_idx, scenario_folder)
+        self.scale_factor = scale_factor
+
+        self.params = get_parameters(scenario_name)
+        self.n_subcarriers = self.params['OFDM']['subcarriers']
+        self.n_ant_bs = self.params['bs_antenna']['shape'][0]
 
         self.all_channels, self.num_total_users = self.get_channels()
         self.user_gains, self.h_spatial = self.get_matrices()
-
-    def get_parameters(self,
-                       scenario: str,
-                       bs_idx: int = 1,
-                       scenario_folder: str = "./scenarios") -> dict:
-        """
-        Constructs the parameter dictionary for DeepMIMOv3 data generation.
-
-        Inputs:
-            scenario (str): The name of the scenario (e.g., 'city_6_miami_v1').
-            bs_idx (int): The index of the active base station.
-
-        Outputs:
-            parameters (dict): A dictionary of parameters compatible with DeepMIMOv3.generate_data.
-        """
-        # 1. Retrieves scenario-specific properties (e.g., antenna counts)
-        scenario_configs = scenario_prop()
-        
-        # 2. Start with default DeepMIMO parameters
-        parameters = DeepMIMOv3.default_params()
-
-        # 3. Basic configuration
-        parameters['dataset_folder'] = scenario_folder
-        # Assumes scenario format is 'name_vX' and extracts the base name
-        parameters['scenario'] = scenario.split("_v")[0]
-        parameters['active_BS'] = np.array([bs_idx])
-        parameters['enable_BS2BS'] = False
-        parameters['num_paths'] = DEFAULT_NUM_PATHS
-
-        # 3. Scenario-specific configuration
-        n_ant_bs = scenario_configs[scenario]['n_ant_bs']
-        n_subcarriers = scenario_configs[scenario]['n_subcarriers']
-        user_rows_config = scenario_configs[scenario]['n_rows']
-
-        if isinstance(user_rows_config, int):
-            parameters['user_rows'] = np.arange(user_rows_config)
-        else: # Assumes a tuple or list [start, end]
-            parameters['user_rows'] = np.arange(user_rows_config[0], user_rows_config[1])
-
-        # 4. BS antenna configuration
-        parameters['bs_antenna']['shape'] = np.array([n_ant_bs, 1])  # [Horizontal, Vertical]
-        parameters['bs_antenna']['rotation'] = DEFAULT_BS_ROTATION
-
-        # 5. UE antenna configuration
-        parameters['ue_antenna']['shape'] = np.array([DEFAULT_NUM_UE_ANTENNAS, 1])
-
-        # 6. OFDM configuration
-        parameters['OFDM']['subcarriers'] = n_subcarriers
-        parameters['OFDM']['selected_subcarriers'] = np.arange(n_subcarriers)
-        parameters['OFDM']['bandwidth'] = 0.02 # 20 MHz for 16 or 32 carriers # 100 MHz for 64 or 128 carriers# (DEFAULT_SUBCARRIER_SPACING * n_subcarriers) / 1e9  # GHz
-
-        return parameters, n_subcarriers, n_ant_bs
     
     def get_channels(self) -> tuple[np.ndarray, int]:
         """
@@ -123,11 +73,10 @@ class DeepMIMOGenerator:
         deepmimo_data = DeepMIMOv3.generate_data(self.params)
 
         # 2. Removes users without a path to the BS
-        # idxs = np.where(deepmimo_data[0]['user']['LoS'] != -1)[0]
-        idxs = np.where(deepmimo_data[0]['user']['LoS'] == 1)[0]
+        idxs = np.where(deepmimo_data[0]['user']['LoS'] != -1)[0]
         cleaned_deepmimo_data = deepmimo_data[0]['user']['channel'][idxs]
         # 3. Removes the UE antenna dimension
-        all_channels = cleaned_deepmimo_data.squeeze()
+        all_channels = cleaned_deepmimo_data.squeeze() * self.scale_factor
 
         num_total_users = all_channels.shape[0]
 
@@ -249,155 +198,334 @@ class DeepMIMOGenerator:
         indices = np.array(dataset_indices)
         dataset_H = self.all_channels[indices] # Shape: (Samples, Users, Antennas, Subcarriers)
 
-        return dataset_H, indices
-
-class Tokenizer:
-    """
-    A Tokenizer that generates tokens for the LWM from wireless channels
-
-    Attributes:
-        patch_rows (int): The number of rows used in each patch
-        patch_cols (int): The number of columns used in each patch
-        cls_value (float): The value that represents the CLS token
-        scale_factor (int): The scale factor for normalization
-    """
-    def __init__(self,
-                 patch_rows: int,
-                 patch_cols: int,
-                 cls_value: float = 0.2,
-                 scale_factor: int = 1e6):
-        """
-        Constrcutor of the tokenizer
-
-        Inputs:
-            patch_rows (int): The number of rows used in each patch
-            patch_cols (int): The number of columns used in each patch
-            cls_value (float): The value that represents the CLS token
-            scale_factor (int): The scale factor for normalization
-        """
-        self.patch_rows = patch_rows
-        self.patch_cols = patch_cols
-        self.cls_value = cls_value
-        self.scale_factor = scale_factor
-
-    def patching(self,
-                 x_complex: torch.Tensor) -> torch.Tensor:
-        """
-        Generates patches from the complex channels
-        
-        Inputs:
-            x_complex (torch.Tensor): The complex wireless channel [B, M, N, SC] or [B, N, SC]
-
-        Outputs:
-            patches (torch.Tensor): The final patches [B, Patches, Features]
-        """
-        # Step 1: Dimension check
-        # Remove Singleton dimension - Currently, the LWM model uses only one antenna in the UE
-        if x_complex.ndim == 4:
-            x_complex = x_complex[:, 0, :, :]
-
-        batch_size, n_rows, n_cols = x_complex.shape
-
-        # Step 2: Split into real and imaginary parts and interleave them
-        x_real = x_complex.real
-        x_imag = x_complex.imag
-        x_interleaved = torch.stack((x_real, x_imag), dim=-1).flatten(start_dim=2)
-
-        # 3. Calculate Padding
-        current_rows = x_interleaved.shape[1]
-        current_cols = x_interleaved.shape[2]
-        patch_width_flat = self.patch_cols * 2 # Real+Imag width
-
-        pad_rows = (self.patch_rows - (current_rows % self.patch_rows)) % self.patch_rows
-        pad_cols = (patch_width_flat - (current_cols % patch_width_flat)) % patch_width_flat
-
-        # 4. Apply Padding
-        if pad_rows > 0 or pad_cols > 0:
-            x_interleaved = F.pad(x_interleaved, (0, pad_cols, 0, pad_rows), value=0)
-
-        # 5. Unfold (Create Patches)
-        # Shape: (B, n_pr, Width, h)
-        patches = x_interleaved.unfold(dimension=1, size=self.patch_rows, step=self.patch_rows)
-        # Shape: (B, n_pr, n_pc, h, w)
-        patches = patches.unfold(dimension=2, size=patch_width_flat, step=patch_width_flat)
-
-        # 6. Flatten to Sequence
-        # Permute to (B, n_pr, n_pc, h, w)
-        # We need to keep this permutation logic consistent for folding back
-        patches = patches.contiguous()
-
-        # 7. Flatten grid (n_pr, n_pc) into Num_Patches
-        patches = patches.flatten(start_dim=1, end_dim=2)
-
-        # 8. Flatten pixels (h, w) into Features
-        patches = patches.flatten(start_dim=2)
-
-        return patches
+        return dataset_H
     
-    def tokenizing(self,
-                   patches: torch.Tensor) -> torch.Tensor:
-        """
-        Generates tokens used in the LWM from tokens.
-        Basically, prepends a CLS token in the beginning of the token sequence
 
-        Inputs:
-            patches (torch.Tensor): The patches used to produce tokens [B, Patches, Features]
-
-        Outputs:
-            tokens (torch.Tensor): The sequence of tokens [B, Sequence Length, Features]
-        """
-        batch_size = patches.shape[0]
-        features = patches.shape[-1]
-        device = patches.device
-
-        # 1. Create CLS token batch
-        cls_tokens = torch.full(
-            (batch_size, 1, features), 
-            self.cls_value, 
-            device=device, 
-            dtype=patches.dtype
-        )
-
-        # 2. Prepend CLS
-        return torch.cat([cls_tokens, patches], dim=1)
+def generate_combined_dataset(scenario_name, n_samples_total, K):
+    """
+    Step 1: Generate Easy + Hard datasets and concatenate.
+    """
+    # Initialize your generator
+    gen = DeepMIMOGenerator(scenario_name)
     
-    def __call__(self,
-                 x_complex: torch.Tensor) -> torch.Tensor:
-        """
-        Transform the complex wireless channel into a sequence of tokens and multiplies for normalization.
+    n_half = n_samples_total // 2
+    
+    print(f"Generating {n_samples_total} samples (Half Easy / Half Hard)...")
+    
+    # 1. Easy Dataset (Orthogonal, Balanced)
+    H_easy = gen.generate_dataset(
+        num_samples=n_half, num_users=K,
+        min_corr=0.0, max_corr=0.4, max_gain_ratio=10.0
+    )
+    
+    # 2. Hard Dataset (Interfering, Unbalanced)
+    H_hard = gen.generate_dataset(
+        num_samples=n_half, num_users=K,
+        min_corr=0.6, max_corr=0.9, max_gain_ratio=50.0
+    )
+    
+    # 3. Concatenate and Shuffle
+    H_all = np.concatenate([H_easy, H_hard], axis=0)
+    np.random.shuffle(H_all)
+    
+    
+    return torch.tensor(H_all)
+
+import os
+import csv
+import torch
+import torch.nn as nn
+import numpy as np
+from torch.utils.data import TensorDataset, DataLoader
+
+from thesis.utils import build_model_from_config
+
+
+import torch
+
+def calculate_noise(H_raw, target_snr_db=5.0, p_total=1.0):
+    """
+    Prepares channel tensors and calculates the specific noise level required 
+    to achieve the target average SNR across the dataset.
+    
+    Args:
+        H_raw (np.ndarray): Raw channel data (N, K, Tx, Sub)
+        target_snr_db (float): Desired average SNR in dB
+        p_total (float): Total transmit power (usually normalized to 1.0)
+        device (str): 'cuda' or 'cpu'
         
-        Inputs:
-            x_complex (torch.Tensor): The complex wireless channel [B, K, N, SC] or [B, N, SC]
+    Returns:
+        H_tensor (torch.Tensor): Complex channel tensor on device
+        noise_val (float): The calculated noise power (sigma^2)
+    """
+    # 2. Calculate Average Signal Power
+    avg_channel_gain = torch.mean(torch.abs(H_raw)**2)
+    signal_power = p_total * avg_channel_gain
+    
+    # 3. Calculate Required Noise Power
+    # SNR_linear = Signal / Noise
+    # Noise = Signal / SNR_linear
+    snr_linear = 10.0 ** (target_snr_db / 10.0)
+    noise_val = (signal_power / snr_linear).item() # Convert to python float
+    
+    return noise_val
 
-        Outputs:
-            tokens (torch.Tensor): The sequence of tokens [B, K, Sequence Length, Features] or [B, Sequence Length, Features]
+import numpy as np
+import torch
+from tqdm import tqdm
+
+def generate_precomputed_dataset(scenario_name, n_samples_total, K):
+    """
+    Generates dataset with PRE-CALCULATED Effective Gains (G).
+    
+    Returns:
+        H_tensor: (N, K, Tx, Sub) [Complex] -> Input for Model
+        G_tensor: (N, K, Sub)     [Float]   -> Input for Loss (Effective Gain)
+    """
+    gen = DeepMIMOGenerator(scenario_name)
+    
+    # 1. Generate Raw Data (Mixed Difficulty)
+    n_half = n_samples_total // 2
+    H_easy = gen.generate_dataset(n_half, K, min_corr=0.0, max_corr=0.4, max_gain_ratio=10.0)
+    H_hard = gen.generate_dataset(n_half, K, min_corr=0.6, max_corr=0.9, max_gain_ratio=50.0)
+    
+    H_raw = np.concatenate([H_easy, H_hard], axis=0)
+    np.random.shuffle(H_raw)
+    
+    # Scale for Neural Net stability
+    scale_factor = 1e6
+    H_scaled = H_raw * scale_factor
+
+    # 2. PRE-COMPUTE 'EFFECTIVE GAINS'
+    print("Pre-computing ZF Gains (Fixing Dimensions)...")
+    N, K, Tx, Sub = H_scaled.shape
+    gains_list = []
+    
+    for i in range(N):
+        H_sample = H_scaled[i] # (K, Tx, Sub)
+        sample_gains = []
+        for s in range(Sub):
+            H_s = H_sample[:, :, s] # (K, Tx)
+            
+            # --- CORRECTED MATH START ---
+            try:
+                # 1. Pseudo-Inverse: Shape becomes (Tx, K)
+                W = np.linalg.pinv(H_s) 
+                
+                # 2. Norm of each column (Per User): Shape (K,)
+                # We calculate norm along axis 0 (The Tx dimension)
+                w_norms = np.linalg.norm(W, axis=0)
+                
+                # 3. Effective Gain = 1 / ||w||^2
+                g = 1.0 / (w_norms**2 + 1e-12)
+            except:
+                g = np.zeros(K)
+            # --- CORRECTED MATH END ---
+            
+            sample_gains.append(g)
+            
+        # sample_gains is List of (K,) -> Convert to (Sub, K)
+        # Transpose to get (K, Sub)
+        gains_list.append(np.array(sample_gains).T) 
+        
+    G_np = np.array(gains_list) # Result: (N, K, Sub)
+    print(f"Gains Shape Verified: {G_np.shape} (Should be {N}, {K}, {Sub})")
+    
+    # Return as Tensors
+    H_tensor = torch.tensor(H_scaled, dtype=torch.complex64)
+    G_tensor = torch.tensor(G_np, dtype=torch.float32)
+    
+    return H_tensor, G_tensor
+
+def solve_water_filling(gains, p_total, noise_val):
+    """
+    Vectorized Water-Filling Solver.
+    Input: (N, K, Sub)
+    Output: (N, K, Sub)
+    """
+    N, K, Sub = gains.shape
+    gains_flat = gains.reshape(N, -1)
+    P_out = np.zeros_like(gains_flat)
+    
+    inv_snr = noise_val / (gains_flat + 1e-12)
+    
+    for i in range(N):
+        g = gains_flat[i]
+        inv = inv_snr[i]
+        sorted_inv = np.sort(inv)
+        
+        for k in range(len(g), 0, -1):
+            wl = (p_total + np.sum(sorted_inv[:k])) / k
+            if wl > sorted_inv[k-1]:
+                P_out[i] = np.maximum(0, wl - inv)
+                break
+                
+    return P_out.reshape(N, K, Sub)
+
+def compute_scalar_rate(power, gains, noise_val):
+    sinr = (power * gains) / (noise_val + 1e-12)
+    return np.mean(np.sum(np.log2(1 + sinr), axis=(1, 2)))
+
+class ScalarSumRateLoss(nn.Module):
+    def forward(self, power_pred, gains, noise_val):
         """
-        input_ndim = x_complex.ndim 
-        x_complex = x_complex * self.scale_factor # Scale factor for LWM
-        # 1. Handle dimensions
-        if input_ndim == 4:
-            # Case A: (Batch, Users, M, S)
-            batch_dim, user_dim, n_rows, n_cols = x_complex.shape
-            # Flatten Batch and User together for processing
-            # New shape: (B*Users, M, S)
-            x_processing = x_complex.reshape(-1, n_rows, n_cols)
+        Rate = Sum log2(1 + P * Gain / Noise)
+        ZERO Beamforming here. Just resource allocation.
+        """
+        # SINR is now just a simple multiplication
+        sinr = (power_pred * gains) / (noise_val + 1e-12)
+        rate = torch.log1p(sinr) / np.log(2)
+        return -torch.mean(torch.sum(rate, dim=[1, 2]))
 
-        elif input_ndim == 3:
-            # Case B: (Batch, M, S)
-            x_processing = x_complex 
-        else:
-            raise ValueError(f"Expected 3D or 4D input, got {x_complex.shape}")
-        # 2. Process
-        patches = self.patching(x_processing)
-        tokens = self.tokenizing(patches)
-        # 3. Restore original shape
-        if input_ndim == 4:
-            # Un-flatten (Batch*Users) -> (Batch, Users)
-            # Current: (Batch*Users, Sequence, Dim)
-            # New shape: (Batch, Users, Sequence, Dim)
-            seq_len = tokens.shape[1]
-            token_dim = tokens.shape[2]
+# --- MAIN RUNNER ---
+def run_no_bf_task(experiment_configs, task_config):
+    device = task_config.DEVICE
+    print(f"--- Starting Power Allocation (Pre-computed Geometry) ---")
+    
+    # 1. GET DATA
+    K = 4
+    # H_tensor: (N, K, Tx, Sub) -> Matches LWM Input Requirement
+    # G_tensor: (N, K, Sub)     -> Matches Loss Requirement
+    H_tensor, G_tensor = generate_precomputed_dataset(
+        task_config.SCENARIO_NAME, n_samples_total=2000, K=K
+    )
+    
+    # Calculate Noise Floor (e.g., 15dB Avg SNR)
+    avg_gain = torch.mean(G_tensor).item()
+    train_noise = avg_gain / (10**(15.0/10.0))
+    
+    # 2. SPLIT DATA
+    n_total = len(H_tensor)
+    idx_bench = int(n_total * 0.8)
+    
+    X_train_full = H_tensor[:idx_bench]
+    G_train_full = G_tensor[:idx_bench]
+    
+    # Benchmark Data (Keep G on CPU for Numpy Solver)
+    X_test = H_tensor[idx_bench:].to(device)
+    G_test = G_tensor[idx_bench:].numpy()
 
-            tokens = tokens.view(batch_dim, user_dim, seq_len, token_dim)
+    # 3. TRAINING LOOP
+    ratios = [0.1, 0.5, 0.8]
+    best_models = {}
 
-        return tokens
+    # 1. Setup Training Log File
+    os.makedirs(task_config.RESULTS_DIR, exist_ok=True)
+    train_log_path = os.path.join(task_config.RESULTS_DIR, "training_log.csv")
+    with open(train_log_path, 'w', newline='') as f:
+        csv.writer(f).writerow(["Ratio", "Model", "Epoch", "Loss", "Train_Rate_bpsHz"])
+
+    for ratio in ratios:
+        n_train = int(len(X_train_full) * ratio)
+        print(f"\n>>> Training Ratio: {ratio*100}% ({n_train} samples)")
+        
+        train_ds = TensorDataset(X_train_full[:n_train], G_train_full[:n_train])
+        train_dl = DataLoader(train_ds, batch_size=task_config.BATCH_SIZE, shuffle=True)
+        
+        for config in experiment_configs:
+            model = build_model_from_config(config)
+            model = model.to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+            criterion = ScalarSumRateLoss()
+            
+            model.train()
+            for epoch in range(task_config.EPOCHS):
+                epoch_loss = 0.0
+                
+                for bx, bg in train_dl:
+                    bx = bx.to(device) # Complex H
+                    bg = bg.to(device) # Scalar Gains
+                    
+                    # Forward
+                    logits = model(bx)
+                    
+                    # Output Constraint: Softmax enforces Sum(P) = 1.0
+                    p_pred = torch.nn.functional.softmax(logits, dim=1).view(bg.shape)
+                    
+                    # Loss (Using Scalar Gains Only)
+                    loss = criterion(p_pred, bg, train_noise)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+                    epoch_loss += loss.item()
+                
+                # --- LOGGING PER EPOCH ---
+                avg_loss = epoch_loss / len(train_dl)
+                # Convert Negative Loss back to Rate for readability
+                avg_rate = -avg_loss 
+                
+                # Print to Console (Optional, every 10 epochs to keep it clean)
+                if (epoch + 1) % 10 == 0:
+                    print(f"   [{config.name}] Epoch {epoch+1:02d}: Loss {avg_loss:.4f} | Rate {avg_rate:.4f} bps/Hz")
+                
+                # Save to CSV
+                with open(train_log_path, 'a', newline='') as f:
+                    csv.writer(f).writerow([ratio, config.name, epoch+1, f"{avg_loss:.4f}", f"{avg_rate:.4f}"])
+            
+            if ratio == 0.8:
+                best_models[config.name] = model
+            print(f"   Model {config.name} trained.")
+
+    print("\n" + "="*60)
+    print(">>> FINAL BENCHMARK: AI (Using H) vs WF (Using Pre-calc G)")
+    print("="*60)
+    
+    results_path = os.path.join(task_config.RESULTS_DIR, "final_benchmark.csv")
+    with open(results_path, 'w', newline='') as f:
+        csv.writer(f).writerow(["Model", "Test_SNR", "SE_AI", "SE_WF", "Ratio_Pct"])
+    
+    # Create a DataLoader for the Test Set
+    # This prevents sending 3000+ complex matrices to the GPU at once
+    test_ds = TensorDataset(X_test)
+    test_loader = DataLoader(test_ds, batch_size=task_config.BATCH_SIZE, shuffle=False)
+    
+    test_snrs = [0, 5, 10, 15, 20, 25, 30]
+
+    for snr in test_snrs:
+        # Calculate Noise
+        noise_val = avg_gain / (10**(snr/10.0))
+        
+        # Baseline (WF on Scalar Gains) - CPU is fine for this
+        P_wf = solve_water_filling(G_test, p_total=1.0, noise_val=noise_val)
+        se_wf = compute_scalar_rate(P_wf, G_test, noise_val)
+        
+        print(f"\n--- SNR {snr} dB (WF Baseline: {se_wf:.3f}) ---")
+        
+        for name, model in best_models.items():
+            model.eval()
+            
+            # --- BATCHED INFERENCE START ---
+            p_ai_batches = []
+            
+            with torch.no_grad():
+                for (bx_test,) in test_loader:
+                    bx_test = bx_test.to(device)
+                    
+                    # Forward
+                    logits = model(bx_test)
+                    
+                    # Softmax & Move to CPU immediately to free GPU memory
+                    # Output: (Batch, K*Sub) or (Batch, K, Sub) depending on model head
+                    p_batch = torch.nn.functional.softmax(logits, dim=1).cpu().numpy()
+                    p_ai_batches.append(p_batch)
+            
+            # Concatenate all batches: (N_total, ...)
+            p_ai = np.concatenate(p_ai_batches, axis=0)
+            
+            # Reshape to match G_test: (N, K, Sub)
+            # Ensure G_test.shape is used correctly
+            p_ai = p_ai.reshape(G_test.shape)
+            # --- BATCHED INFERENCE END ---
+
+            # AI Score
+            se_ai = compute_scalar_rate(p_ai, G_test, noise_val)
+            
+            ratio = (se_ai / se_wf) * 100.0
+            
+            with open(results_path, 'a', newline='') as f:
+                csv.writer(f).writerow([name, snr, f"{se_ai:.4f}", f"{se_wf:.4f}", f"{ratio:.2f}"])
+            print(f"   {name:<15}: {ratio:.2f}% Optimal")
+    
+    print("Done.")
