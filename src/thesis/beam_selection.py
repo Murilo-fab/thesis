@@ -1,32 +1,42 @@
 import os
 import csv
+import time
 from tqdm import tqdm
 from datetime import datetime
 
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 
 import torch
-from sklearn.metrics import accuracy_score
+import torch.nn as nn
+import torch.optim as optim
+
+from sklearn.manifold import TSNE
+from sklearn.metrics import f1_score
 
 import DeepMIMOv3
 
-from thesis.utils import get_parameters
-from thesis.utils import build_model_from_config, create_dataloaders
+from thesis.data_classes import TaskConfig
+from thesis.downstream_models import build_model_from_config
+from thesis.utils import (create_dataloaders, apply_awgn, get_parameters,
+                          get_flops_and_params, get_latency, extract_features)
 
 class BeamPredictionGenerator:
+    """
+    Handles data generation for Beam Prediction.
+    Caches the cleaned channel matrices to allow fast re-labeling for different beam codebooks.
+    """
     def __init__(self, scenario_name, scale_factor=1e6):
         self.params = get_parameters(scenario_name)
         self.scale_factor = scale_factor
         
         # Cache for the clean data
         self.clean_chs = None 
-        self.clean_locs = None # Useful if you plot coverage later
+        self.clean_locs = None
 
     def load_raw_data(self):
         """
-        Loads and filters data. 
-        Only keeps users where LoS != -1.
+        Loads and filters data. Only keeps users where LoS != -1.
         """
         print(f"Loading Data for {self.params['scenario']}...")
         
@@ -37,35 +47,31 @@ class BeamPredictionGenerator:
         raw_los = deepmimo_data[0]['user']['LoS']
         raw_loc = deepmimo_data[0]['user']['location'] # (N, 3)
         
-        # 2. Identify Valid Indices Immediately
-        # We only care about users that exist in the simulation
+        # 2. Identify Valid Indices
         valid_idxs = np.where(raw_los != -1)[0]
         
         # 3. Filter and Store
-        # We reduce the dataset size by ~30-50% here instantly
         self.clean_chs = raw_chs[valid_idxs]
         self.clean_locs = raw_loc[valid_idxs]
         
-        print(f"   Original Users: {len(raw_los)}")
-        print(f"   Valid Users:    {len(self.clean_chs)}")
+        print(f"\tValid Users:    {len(self.clean_chs)}")
         
         return self.clean_chs
 
     def compute_labels_for_beams(self, n_beams):
         """
-        Generates X, y for a specific number of beams using the pre-filtered data.
+        Generates (X, y) for a specific codebook size using cached data.
         """
         if self.clean_chs is None:
             self.load_raw_data()
 
         # 1. Compute Labels
-        # We pass the clean channels. No need to pass 'los' anymore since we know they are valid.
         beam_indices, valid_mask = self._compute_beam_labels(self.clean_chs, n_beams)
         
         # 2. Final Filter (removing users with 0 power / NaN beams)
-        # Even if LoS != -1, beamforming might technically fail (yield 0)
         final_chs = self.clean_chs[valid_mask]
         final_labels = beam_indices[valid_mask]
+        final_locs = self.clean_locs[valid_mask]
         
         # 3. Format
         if final_chs.ndim == 4:
@@ -74,11 +80,11 @@ class BeamPredictionGenerator:
         X = torch.tensor(final_chs, dtype=torch.complex64) * self.scale_factor
         y = torch.tensor(final_labels, dtype=torch.long)
         
-        return X, y
+        return X, y, final_locs
 
     def _compute_beam_labels(self, channels, n_beams):
         """
-        Simplified beam search. No 'if los == -1' check needed.
+        Performs exhaustive beam search to find the best beam index for each user.
         """
         n_users = len(channels)
         
@@ -99,7 +105,6 @@ class BeamPredictionGenerator:
         best_beams = np.zeros(n_users, dtype=int)
         valid_mask = np.zeros(n_users, dtype=bool)
         
-        # Vectorized batch processing is possible here, but loop is fine for readability
         for i in tqdm(range(n_users), desc=f"   Beam Search ({n_beams})"):
             
             # 1. Prepare Channel
@@ -126,51 +131,35 @@ class BeamPredictionGenerator:
         resp = DeepMIMOv3.array_response(idxs, phi, theta + np.pi/2, kd)
         return resp / np.linalg.norm(resp)
 
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import time
-from sklearn.metrics import f1_score
-
 def train_downstream(
     model: nn.Module,
-    train_loader: DataLoader, 
-    val_loader: DataLoader, 
-    task_config,
-    run_name: str,
-    results_folder: str
+    train_loader, 
+    val_loader, 
+    task_config: TaskConfig,
 ) -> tuple[float, nn.Module, dict]:
     """
-    Trains a classifier and returns the model.
+    Trains a classifier.
+    Returns: (current_f1, model, history, total_train_time)
     """
-    device = task_config.DEVICE
+    device = task_config.device
     model.to(device)
 
-    # 1. Setup Log
-    os.makedirs(results_folder, exist_ok=True)
-    log_file = os.path.join(results_folder, f"training_log_{run_name}.csv")
-
-    headers = ["Epoch", "Train Loss", "Validation Loss", "Val F1", "Time(s)"]
-
-    with open(log_file, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(headers)
-    
-    # 2. Initialize Model & Optimizer
+    # Initialize Model & Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable_params, lr=task_config.LR)
+    optimizer = optim.Adam(trainable_params, lr=task_config.lr)
 
     crit = nn.CrossEntropyLoss()
     
     # History Container
     history = {'train_loss': [], 'val_loss': [], 'val_f1': []}
-    
-    start_time = time.time()
     current_f1 = 0.0
 
-    # 3. Training Loop
-    for epoch in range(task_config.EPOCHS):
+    total_train_time = 0.0  # Time spent optimizing (Backprop)
+
+    # Training Loop
+    for epoch in range(task_config.epochs):
         # --- Train Phase ---
+        t0_train = time.time()
         model.train()
         train_loss_sum = 0
         train_batches = 0
@@ -186,7 +175,10 @@ def train_downstream(
             
             train_loss_sum += loss.item()
             train_batches += 1
-            
+        
+        if device == 'cuda': torch.cuda.synchronize()
+        total_train_time += (time.time() - t0_train)
+
         avg_train_loss = train_loss_sum / train_batches
         history['train_loss'].append(avg_train_loss)
             
@@ -218,238 +210,156 @@ def train_downstream(
         history['val_loss'].append(avg_val_loss)
         history['val_f1'].append(current_f1)
 
-        # Timing
-        elapsed_time = time.time() - start_time
-        
-        # --- Logging to CSV
-        with open(log_file, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                epoch + 1,
-                f"{avg_train_loss:.6f}",
-                f"{avg_val_loss:.6f}",
-                f"{current_f1:.6f}",
-                f"{elapsed_time:.2f}"
-            ])
-
-    return current_f1, model, history
-
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
-
-@dataclass
-class TaskConfig:
-    TASK_NAME: str = "Beam_Selection"
-    SCENARIO_NAME: str = "city_6_miami"
-    RESULTS_DIR: str = "./results"
-    
-    # Sweep Parameters
-    TRAIN_RATIOS: list = (0.08, 0.16, 0.24, 0.32, 0.4, 0.48, 0.56, 0.64, 0.72, 0.80)
-    SNR_RANGE: list = (-5, 0, 5, 10, 15, 20)
-    
-    # Training Hyperparameters
-    BATCH_SIZE: int = 128
-    EPOCHS: int = 50
-    LR: float = 1e-3
-    DEVICE: str = "cuda"
-
+    return current_f1, model, history, total_train_time
 
 def run_beam_selection_task(experiment_configs, task_config: TaskConfig):
     """
-    Runs a hierarchical sweep for Beam Prediction:
-    Outer Loop: Codebook Size (16, 32, 64, 128, 256 beams)
-    Inner Loop: Data Efficiency (10% -> 100% data)
-    Final Step: SNR Robustness sweep for the best models of each beam size.
     """
-    device = task_config.DEVICE
-    print(f"--- Starting Task: {task_config.TASK_NAME} (Beam Selection) ---")
+    task_name = task_config.task_name
+    device = task_config.device
+    print(f"Starting Task: {task_name}")
     
-    # ====================================================
-    # 1. SETUP & INITIALIZATION
-    # ====================================================
-    # Create Results Directory
+    # Setup and data generation
+    # Create Timestamped Results Folder
     time_now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    results_folder = os.path.join(task_config.RESULTS_DIR, task_config.TASK_NAME, time_now)
+    results_folder = os.path.join(task_config.results_dir, task_name, task_config.scenario_name, time_now)
     os.makedirs(results_folder, exist_ok=True)
-    
-    # Initialize Generator (Loads raw data ONCE)
-    # We start with a dummy beam count; it will be updated in the loop.
-    print(f"\n[1/5] Initializing Generator for {task_config.SCENARIO_NAME}...")
-    generator = BeamPredictionGenerator(task_config.SCENARIO_NAME)
-    generator.load_raw_data() # Optimally filters out invalid (LoS=-1) users immediately
+    print(f"Results will be saved to: {results_folder}")
 
-    # Define Sweep Parameters
-    BEAM_COUNTS = [16, 32, 64, 128, 256] 
-    # Use ratios from task_config (e.g., [0.1, ... 1.0])
+    generator = BeamPredictionGenerator(task_config.scenario_name)
+    generator.load_raw_data() 
+
+    # Storage for results
+    tsne_results = []
     
-    # Result Containers for Plotting
-    # structure: results[n_beams][model_name] = [scores...]
-    efficiency_results = {} 
-    snr_results = {}
+    # Log paths
+    efficiency_log_file = os.path.join(results_folder, "data_efficiency_results.csv")
+    snr_log_file = os.path.join(results_folder, "snr_results.csv")
+    resources_log_file = os.path.join(results_folder, "resources_results.csv")
+
+    # Initialize CSV
+    with open(efficiency_log_file, mode='w', newline='') as f:
+        csv.writer(f).writerow(["Num_Beams", "Train_Ratio", "Train_Samples", "Model_Name", "Final_F1", "Training_Time"])
     
-    # CSV Headers
-    eff_log_file = os.path.join(results_folder, "beam_efficiency_results.csv")
-    snr_log_file = os.path.join(results_folder, "beam_snr_results.csv")
-    
-    with open(eff_log_file, 'w', newline='') as f:
-        csv.writer(f).writerow(["Num_Beams", "Train_Ratio", "Train_Samples", "Model_Name", "Weighted_F1"])
     with open(snr_log_file, 'w', newline='') as f:
-        csv.writer(f).writerow(["Num_Beams", "SNR_dB", "Model_Name", "Accuracy"])
+        csv.writer(f).writerow(["Num_Beams", "SNR_dB", "Model_Name", "F1_Score"])
 
-    # ====================================================
-    # 2. OUTER LOOP: BEAMBOOK SIZE (Complexity)
-    # ====================================================
-    for n_beams in BEAM_COUNTS:
-        print(f"\n" + "="*50)
-        print(f" CONFIGURATION: {n_beams} BEAMS")
-        print(f"="*50)
+    with open(resources_log_file, mode='w', newline='') as f:
+        csv.writer(f).writerow(["Num_Beams", "Model_Name", "MFLOPs", "Params_M", "Encoder_ms", "Head_ms"])
+
+    for config in experiment_configs:
+        name = config.name
         
-        efficiency_results[n_beams] = {cfg.name: [] for cfg in experiment_configs}
-        snr_results[n_beams] = {cfg.name: [] for cfg in experiment_configs}
-        
-        # A. Update Labels
-        # Re-run beam search on the cached clean channels
-        print(f"   > Computing labels for {n_beams} beams...")
-        X, y = generator.compute_labels_for_beams(n_beams)
-        total_samples = len(X)
-        print(f"   > Dataset ready: {total_samples} samples.")
+        for n_beams  in task_config.task_complexity:
+            print(f"Training model: {name} | Configuration with {n_beams} beams.")
+            config.output_size = n_beams
 
-        # B. Update Model Configs
-        # Crucial: Resize the classifier output head to n_beams
-        for cfg in experiment_configs:
-            cfg.head_args['num_classes'] = n_beams
+            X_all, y_all, locs = generator.compute_labels_for_beams(n_beams)
+            total_samples = len(X_all)
 
-        # C. Define Fixed Test Set for SNR (for this beam config)
-        # We split once per beam-config to ensure consistent SNR testing
-        _, test_dl_clean = create_dataloaders(X, y, train_ratio=0.8, val_ratio=0.2, seed=42)
-        X_test_clean, y_test_fixed = test_dl_clean.dataset.tensors
-        
-        # Cache for models trained on 100% data (for SNR sweep)
-        current_beam_models = {}
-
-        # ====================================================
-        # 3. INNER LOOP: DATA EFFICIENCY (Ratios)
-        # ====================================================
-        print(f"   > Starting Ratio Sweep...")
-        for ratio in task_config.TRAIN_RATIOS:
-            n_train_samples = int(total_samples * ratio)
-            train_dl, val_dl = create_dataloaders(X, y, train_ratio=ratio, seed=42)
+            map_path = os.path.join(results_folder, f"user_map_data_{n_beams}_beams.csv")
+            df_map = pd.DataFrame({
+                'x': locs[:, 0],
+                'y': locs[:, 1],
+                'z': locs[:, 2],
+                'beam_index': y_all.numpy()
+                })
+            df_map.to_csv(map_path, index=False)
             
-            for config in experiment_configs:
-                # 1. Build Model (Head size is now n_beams)
+            # 2. Data efficiency
+            for ratio in task_config.train_ratios:
+                n_train_samples = int(total_samples * ratio)
+
+                # Create DataLoaders
+                train_dl, val_dl = create_dataloaders(X_all, y_all, train_ratio=ratio, seed=42)
+
+                # A. Build Fresh Model - This needs some adjustment
                 model = build_model_from_config(config)
-                
-                # 2. Train
-                run_name = f"B{n_beams}_{config.name}_R{ratio}"
-                score, trained_model, _ = train_downstream(
-                    model, train_dl, val_dl, task_config, run_name, results_folder
-                )
-                
-                # 3. Log
-                efficiency_results[n_beams][config.name].append(score)
-                with open(eff_log_file, 'a', newline='') as f:
-                    csv.writer(f).writerow([n_beams, ratio, n_train_samples, config.name, f"{score:.4f}"])
-                
-                # 4. Cache if Max Ratio
-                if ratio == task_config.TRAIN_RATIOS[-1]:
-                    current_beam_models[config.name] = trained_model
-            
-            # Print brief status for the first model in list
-            ref_model = experiment_configs[0].name
-            print(f"     Ratio {ratio:.2f}: {ref_model} = {efficiency_results[n_beams][ref_model][-1]:.4f}")
 
-        # ====================================================
-        # 4. SNR SWEEP (For this Beam Count)
-        # ====================================================
-        print(f"   > Starting SNR Sweep (on {n_beams}-beam models)...")
-        
-        for snr in task_config.SNR_RANGE:
-            # Add noise to the FIXED test set
-            X_test_noisy = apply_awgn(X_test_clean, snr)
+                # B. Train - This needs some adjustment
+                final_f1, model, _, total_train_time = train_downstream(model, train_dl, val_dl, task_config)
+
+                # C. Log
+                with open(efficiency_log_file, mode='a', newline='') as f:
+                    csv.writer(f).writerow([n_beams, ratio, n_train_samples, name, f"{final_f1:.4f}", f"{total_train_time:.2f}s"])
+
+                print(f"\tRatio {ratio:.4f} | Training Samples: {n_train_samples} | Final F1: {final_f1:.4f}")
+
+            # 3. Resources metrics
+            input_sample = X_all[0:1]
+
+            computational_cost = get_flops_and_params(model, input_sample, device)
+            latency = get_latency(model, input_sample, device)
+
+            with open(resources_log_file, mode='a', newline='') as f:
+                csv.writer(f).writerow([n_beams, name, computational_cost["MFLOPs"], computational_cost["Params_M"],
+                                        f"{latency['Encoder_ms']:.4f}", f"{latency['Head_ms']:.4f}"])
+
+            print(f"\tMFLOPs: {computational_cost['MFLOPs']} | Params_M: {computational_cost['Params_M']}",
+                  f"| Encoder Latency: {latency['Encoder_ms']:.4f} | Head Latency: {latency['Head_ms']:.4f}")
             
-            test_ds = torch.utils.data.TensorDataset(X_test_noisy, y_test_fixed)
-            test_dl = torch.utils.data.DataLoader(test_ds, batch_size=task_config.BATCH_SIZE, shuffle=False)
-            
-            for config in experiment_configs:
-                name = config.name
-                if name not in current_beam_models: continue
-                
-                model = current_beam_models[name]
-                model.eval()
-                
-                # Inference
+            # 4. Noise robustness
+
+            # Define fixed test set
+            _, test_dl_clean = create_dataloaders(X_all, y_all, train_ratio=0.8, val_ratio=0.2, seed=42)
+
+            # Extract the raw tensors to add noise to them manually
+            X_test_clean, y_test_fixed = test_dl_clean.dataset.tensors
+
+            for snr in task_config.snr_range:
+                # Apply noise dynamically to dataset
+                X_test_noisy = apply_awgn(X_test_clean, snr)
+
+                test_ds = torch.utils.data.TensorDataset(X_test_noisy, y_test_fixed)
+                test_dl = torch.utils.data.DataLoader(test_ds, batch_size=task_config.batch_size, shuffle=False)
+
+                # List for metrics
                 all_preds = []
                 all_targets = []
+
+                model.eval()
                 with torch.no_grad():
                     for bx, by in test_dl:
                         logits = model(bx.to(device))
                         all_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
                         all_targets.extend(by.numpy())
+
+                f1 = f1_score(all_targets, all_preds, average='weighted')
+
+                # Log
+                with open(snr_log_file, mode='a', newline='') as f:
+                    csv.writer(f).writerow([n_beams, snr, name, f"{f1:.4f}"])
+
+                print(f"\tSNR {snr} | Final F1: {f1:.4f}")
+
+            # 5. Latent space (t-SNE)
+            print("\tRunning t-SNE Analysis...")
+
+            vis_ds = torch.utils.data.TensorDataset(X_all, y_all)
+            vis_dl = torch.utils.data.DataLoader(vis_ds, batch_size=task_config.batch_size, shuffle=False)
+
+            # A. Extract Latent Features
+            features_np, labels_np = extract_features(model, vis_dl, device)
+
+            # B. Compute t-SNE
+            tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca', learning_rate='auto')
+            emb = tsne.fit_transform(features_np)
+
+            # C. Store for CSV
+            df_temp = pd.DataFrame({
+                'tsne_1': emb[:, 0],
+                'tsne_2': emb[:, 1],
+                'label': labels_np,
+                'model_name': name,
+                'n_beams': n_beams
+                })
+            tsne_results.append(df_temp)
+            print("\tt-SNE Analysis Complete")
+
+    # Save CSV
+    tsne_csv_path = os.path.join(results_folder, "tsne_comparison_data.csv")
+    if tsne_results:
+        pd.concat(tsne_results, ignore_index=True).to_csv(tsne_csv_path, index=False)
+        print(f"   t-SNE data saved to: {tsne_csv_path}")
+
                 
-                # Metric: Accuracy is preferred for SNR sweeps (easier to interpret)
-                acc = accuracy_score(all_targets, all_preds)
-                snr_results[n_beams][name].append(acc)
-                
-                with open(snr_log_file, 'a', newline='') as f:
-                    csv.writer(f).writerow([n_beams, snr, name, f"{acc:.4f}"])
-
-    # ====================================================
-    # 5. VISUALIZATION
-    # ====================================================
-    print("\n[5/5] Generating Plots...")
-    
-    # We generate 2 Plot Files:
-    # 1. Complexity vs Efficiency (How hard is 256 beams vs 16?)
-    # 2. SNR Robustness (How fast does 256 beams fail vs 16?)
-    
-    # --- Plot 1: Efficiency Curves for different Beam Counts (Target Model Only) ---
-    target_model = experiment_configs[0].name # Usually "LWM" or "AE"
-    
-    plt.figure(figsize=(10, 6))
-    colors = plt.cm.viridis(np.linspace(0, 1, len(BEAM_COUNTS)))
-    
-    for i, n_beams in enumerate(BEAM_COUNTS):
-        if target_model in efficiency_results[n_beams]:
-            scores = efficiency_results[n_beams][target_model]
-            plt.plot(task_config.TRAIN_RATIOS, scores, 'o-', color=colors[i], label=f"{n_beams} Beams")
-            
-    plt.title(f"Impact of Codebook Size on Efficiency ({target_model})")
-    plt.xlabel("Training Ratio")
-    plt.ylabel("Weighted F1 Score")
-    plt.grid(True, alpha=0.3)
-    plt.legend(title="Codebook Size")
-    plt.savefig(os.path.join(results_folder, "beam_complexity_efficiency.png"), dpi=300)
-    
-    # --- Plot 2: SNR Curves for different Beam Counts ---
-    plt.figure(figsize=(10, 6))
-    
-    for i, n_beams in enumerate(BEAM_COUNTS):
-        if target_model in snr_results[n_beams]:
-            scores = snr_results[n_beams][target_model]
-            plt.plot(task_config.SNR_RANGE, scores, 's--', color=colors[i], label=f"{n_beams} Beams")
-
-    plt.title(f"Impact of Codebook Size on Robustness ({target_model})")
-    plt.xlabel("SNR (dB)")
-    plt.ylabel("Accuracy")
-    plt.grid(True, alpha=0.3)
-    plt.legend(title="Codebook Size")
-    plt.savefig(os.path.join(results_folder, "beam_complexity_snr.png"), dpi=300)
-
-    print("\nDone. All results saved.")
-    # plt.show()
-
-def apply_awgn(x_complex, snr_db):
-    """
-    Applies Additive White Gaussian Noise to a batch of complex channels.
-    """
-    # x_complex: (N, 32, 32)
-    # Calculate signal power per sample
-    sig_power = torch.mean(torch.abs(x_complex)**2, dim=(1,2), keepdim=True)
-    
-    snr_linear = 10**(snr_db / 10.0)
-    noise_power = sig_power / snr_linear
-    noise_std = torch.sqrt(noise_power / 2)
-    
-    # Noise must match device of input, but usually applied on CPU before norm
-    noise = torch.randn_like(x_complex) * noise_std + 1j * torch.randn_like(x_complex) * noise_std
-    return x_complex + noise

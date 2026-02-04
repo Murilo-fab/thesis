@@ -1,9 +1,9 @@
 import os
 import subprocess
-from typing import TypedDict, Optional
 
 import torch
-from torch.utils.data import TensorDataset, DataLoader, Subset
+from torchinfo import summary
+from torch.utils.data import TensorDataset, DataLoader
 
 import DeepMIMOv3
 import numpy as np
@@ -20,7 +20,6 @@ def get_parameters(scenario):
     SCS = 30e3
     DEFAULT_NUM_PATHS = 20
 
-
     # 1. Retrieves scenario-specific properties (e.g., antenna counts)
     scenario_configs = scenario_prop()
 
@@ -28,7 +27,7 @@ def get_parameters(scenario):
     params = DeepMIMOv3.default_params()
 
     # 3. Basic configuration
-    params['dataset_folder'] = './scenarios'
+    params['dataset_folder'] = '../scenarios'
     params['scenario'] = scenario.split("_v")[0]
 
     # BS Selection Logic
@@ -59,17 +58,6 @@ def get_parameters(scenario):
     params['OFDM']['bandwidth'] = scs * n_subcarriers / 1e9
     
     return params
-
-class OptimizerConfigs(TypedDict):
-    """
-    Type definition for Optimizer configuration parameters.
-
-    Attributes:
-        task_head_lr (float): Learning rate for the task-specific head.
-        encoder_lr (Optional[float]): Learning rate for the encoder (if applicable).
-    """
-    task_head_lr: float
-    encoder_lr: Optional[float]
 
 def create_dataloaders(inputs, labels=None, train_ratio=0.8, val_ratio=0.2, batch_size=32, seed=42):
     """
@@ -170,123 +158,119 @@ def clone_scenarios(scenario_name: str,
 
     print(f"Successfully cloned {scenario_name} into {scenario_path}.")
 
-def normalize_channels(x_complex):
+def apply_awgn(x_complex, snr_db):
     """
-    Normalizes the (B, 32, 32) complex tensor.
-    """
-    # 1. View as floats to get global mean/std of the signal
-    # (B, 32, 32) complex -> (B, 32, 32, 2) real -> flat
-    all_values = torch.view_as_real(x_complex)
-    mean = all_values.mean()
-    std = all_values.std()
+    Applies Global Standard AWGN to a batch of complex tensors.
 
-    # 2. Apply Normalization directly to Complex Tensor
-    x_norm = (x_complex - mean) / (std + 1e-9)
-    
-    return x_norm
-
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
-
-@dataclass
-class ModelConfig:
-    name: str
-    encoder_type: str
-
-    task_type: str
-    latent_dim: int
-    
-    weights_path: Optional[str] = None
-    # freeze_encoder: bool = True
-    
-    # Extra args for specific wrappers (e.g., tokenizer for LWM)
-    extra_args: Dict[str, Any] = field(default_factory=dict)
-    
-    # Head configuration (e.g., num_classes=2)
-    head_args: Dict[str, Any] = field(default_factory=lambda: {"num_classes": 2})
-
-import torch
-
-from thesis.csi_autoencoder import *
-from thesis.lwm_model import * 
-from thesis.downstream_models import *
-
-
-def build_model_from_config(config: ModelConfig):
-    """
-    Factory function that instantiates a model based on the provided configuration.
-    """
-    # 1. Build task head
-    input_dim = config.head_args['input_size']
-    num_classes = config.head_args.get('num_classes', 2)
-    
-    if config.task_type == "classification":
-        task_head = ClassificationHead(input_dim, num_classes)
-    elif config.task_type == "regression":
-        # Regression: Output 1 value, usually no softmax
-        task_head = ClassificationHead(input_dim, 1) 
-    else:
-        return None
-
-    # 2. Build backbone & wrap
-    
-    # Case A: Autoencoder
-    if config.encoder_type == "AE":
-        # Instantiate Base Architecture
-        backbone = CSIAutoEncoder(latent_dim=config.latent_dim)
+    Args:
+        x_complex (Tensor): Input batch of shape (B, ...), e.g., (B, U, 32, 32)
+        snr_db (float/int): The target SNR in decibels.
         
-        # Load Weights (if provided, otherwise it's a Raw/Random AE)
-        if config.weights_path:
-            backbone.load_weights(config.weights_path)
+    Returns:
+        Tensor: The noisy complex signal.
+    """
+    # 1. Calculate the global signal power per batch item
+    dims = tuple(range(1, x_complex.ndim))
+    sig_power = torch.mean(torch.abs(x_complex)**2, dim=dims, keepdim=True)
+    
+    # 2. Convert SNR from dB to linear scale
+    snr_linear = 10**(snr_db / 10.0)
 
-        # Wrap
-        model = CSIAEWrapper(
-            csi_ae_model=backbone, 
-            task_head=task_head
-        )
+    # 3. Derive noise power and standard deviation
+    # P_noise = P_signal / SNR
+    noise_power = sig_power / (snr_linear + 1e-12)
 
-    # Case B: LWM
-    elif config.encoder_type == "LWM":
-        # Configs
-        tokenizer = Tokenizer(patch_rows=4, patch_cols=4, scale_factor=1e0)
-        
-        if config.weights_path:
-            backbone = lwm.from_pretrained(config.weights_path)
-        else:
-            backbone = lwm()
+    # In complex AWGN, the noise power is split equally between Real and Imag
+    # std = sqrt(P_noise / 2)
+    noise_std = torch.sqrt(noise_power / 2)
 
-        # Wrap
-        model = LWMWrapper(
-            tokenizer=tokenizer,
-            lwm_model=backbone,
-            task_head=task_head,
-            mode=config.extra_args.get("lwm_mode", "cls"),
-        
-        )
+    # 4. Generate Complex Noise
+    noise_real = torch.randn_like(x_complex.real) * noise_std
+    noise_imag = torch.randn_like(x_complex.imag) * noise_std
+    
+    return x_complex + torch.complex(noise_real, noise_imag)
 
-        fine_tune_layers = config.extra_args.get("fine_tune_layers")
-
-        if fine_tune_layers:
-            model.unfreeze_layers(fine_tune_layers)
-
-    # Case C: Raw Data
-    elif config.encoder_type is None:
-        # No backbone, just the head operating on flattened data
-        # We use a simple wrapper to handle flattening if needed
-        class LinearWrapper(torch.nn.Module):
-            def __init__(self, head):
-                super().__init__()
-                self.head = head
-            def forward(self, x):
-                # Flatten (Batch, 32, 32) -> (Batch, 2048)
-                if x.ndim > 2:
-                    x = torch.hstack((x.real, x.imag)).flatten(start_dim=1)
-                return self.head(x)
+def extract_features(model, dataloader, device):
+    """
+    Runs inference but stops before the classification head to get latent features.
+    """
+    model.eval()
+    all_features = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for bx, by in dataloader:
+            bx = bx.to(device)
+            
+            # Get features through the Wrapper
+            if hasattr(model, 'get_features'):
+                feats = model.get_features(bx).flatten(start_dim=1)
+            else:
+                # Fallback to standard forward pass if get_features isn't used
+                feats = model(bx)
                 
-        model = LinearWrapper(task_head)
+            all_features.append(feats.cpu().numpy())
+            all_labels.append(by.cpu().numpy())
+            
+    return np.concatenate(all_features), np.concatenate(all_labels)
 
-    else:
-        raise ValueError(f"Unknown encoder_type: {config.encoder_type}")
+def get_flops_and_params(model, input_tensor, device):
+    """
+    Calculates theoretical computational cost.
+    """
+    model = model.to(device)
+    model.eval()
+    input_tensor = input_tensor.to(device)
+    try:
+        stats = summary(model, input_data=input_tensor, verbose=0)
+        return {
+                "MFLOPs": stats.total_mult_adds / 1e6,
+                "Params_M": stats.total_params / 1e6
+            }
+    except Exception as e:
+        print(f"FLOPs calculation failed: {e}")
+        return {"MFLOPs": 0, "Params_M": 0}
 
-    return model
+def get_latency(model, input_tensor, device, n_repeat=500):
+    """
+    Measures Encoder vs Head latency separately.
+    """
+    input_tensor = input_tensor.to(device)
+    # 1. Warmup
+    with torch.no_grad():
+        for _ in range(50):
+            feats = model.get_features(input_tensor)
+            _ = model.task_head(feats)
 
+    # 2. Setup Timers
+    start = torch.cuda.Event(enable_timing=True)
+    mid   = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+
+    enc_times = []
+    head_times = []
+
+    # 3. Measurement Loop
+    with torch.no_grad():
+        for _ in range(n_repeat):
+            start.record()
+
+            # Encoder pass
+            feat = model.get_features(input_tensor)
+
+            mid.record()
+
+            # Head pass
+            _ = model.task_head(feat)
+
+            end.record()
+
+            torch.cuda.synchronize()
+
+            enc_times.append(start.elapsed_time(mid))
+            head_times.append(mid.elapsed_time(end))
+
+    return {
+        "Encoder_ms": np.mean(enc_times),
+        "Head_ms": np.mean(head_times)
+    }

@@ -15,13 +15,12 @@ requires-python = ">=3.8"
 dependencies = [
     "DeepMIMOv3",
     "torch",
+    "torchinfo",
     "numpy",
-    "trackio",
     "tqdm",
     "matplotlib",
     "scikit-learn",
     "seaborn",
-    "faker"
 ]
 
 [tool.setuptools.packages.find]

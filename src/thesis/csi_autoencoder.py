@@ -37,8 +37,9 @@ class RefineBlock(nn.Module):
         return self.relu(out + residual)
 
 class CSIAutoEncoder(nn.Module):
-    def __init__(self, latent_dim=64):
+    def __init__(self, latent_dim=64, mode="inference"):
         super().__init__()
+        self.mode = mode
         
         # Encoder
         self.input_norm = nn.BatchNorm2d(2)
@@ -120,6 +121,9 @@ class CSIAutoEncoder(nn.Module):
         feat = self.encoder(x_norm)
         z = self.fc_enc(feat)
         
+        if self.mode == "inference":
+            return z
+        
         # 3. Decode
         # Expand Latent
         x_recon = self.fc_dec(z).view(-1, 128, 8, 8)
@@ -134,46 +138,6 @@ class CSIAutoEncoder(nn.Module):
         x_recon = self.decoder_final(x_recon)   # (B, 2, 32, 32)
         
         return z, torch.complex(x_recon[:,0], x_recon[:,1])
-    
-    
-class CSIAEWrapper(nn.Module):
-    def __init__(self, csi_ae_model, task_head):
-        super().__init__()
-        self.csi_ae_model = csi_ae_model
-        self.task_head = task_head
-
-        for param in self.csi_ae_model.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        """
-        Args:
-            x: (Batch, 32, 32) OR (Batch, K_Users, 32, 32)
-        Returns:
-            Output from task_head (B, K, Dim) or (B, Dim)
-        """
-        # 1. Shape Handling (Flatten Multi-User)
-        if x.ndim == 4:
-            B, K, M, N = x.shape
-            # Flatten to (B*K, M, N) for the standard Encoder
-            encoder_input = x.view(B * K, M, N)
-        else:
-            encoder_input = x
-
-        # 2. Extract Features
-        features, _ = self.csi_ae_model(encoder_input)
-
-        # 3. Restore Multi-User shape
-        if x.ndim == 4:
-            B, K, M, N = x.shape
-            # Flatten to (B*K, M, N) for the standard Encoder
-            # features = features.view(B, K, -1)
-            features = features.view(B, -1)
-
-        # 4. Task Head
-        out = self.task_head(features)
-
-        return out
     
 @dataclass
 class TrainingConfig:

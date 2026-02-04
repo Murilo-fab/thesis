@@ -1,0 +1,11 @@
+{
+    "name": "Raw",
+    "encoder_type": null,
+    "mode": "raw",
+    "input_size": 2048,
+    "output_size": 2,
+    "latent_dim": null,
+    "weights_path": null,
+    "task_type": "classification",
+    "fine_tune_layers": null
+}
