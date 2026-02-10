@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thesis"
 version = "1.0.0"
-description = "Package for the thesis"
+description = "Deep Learning Framework for Wireless Communications (LoS/NLoS, Beam Prediction, Power Allocation)"
 readme = "README.md"
 authors = [
     { name="Murilo Ferreira Alves Batista", email="murilo.fab@outlook.com" }
@@ -13,15 +13,18 @@ authors = [
 license = { text = "MIT" }
 requires-python = ">=3.8"
 dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "scikit-learn>=1.2.0",
+    "tqdm>=4.65.0",
+    "torchinfo>=1.8.0",
     "DeepMIMOv3",
-    "torch",
-    "torchinfo",
-    "numpy",
-    "tqdm",
-    "matplotlib",
-    "scikit-learn",
-    "seaborn",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+namespaces = true

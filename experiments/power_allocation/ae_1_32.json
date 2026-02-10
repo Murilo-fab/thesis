@@ -1,0 +1,11 @@
+{
+    "name": "AE - 1/32",
+    "encoder_type": "AE",
+    "mode": "ae",
+    "input_size": 64,
+    "output_size": 2,
+    "latent_dim": 64,
+    "weights_path": "../models/csi_autoencoder_64.pth",
+    "task_type": "regression",
+    "fine_tune_layers": null
+}

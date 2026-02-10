@@ -1,16 +1,17 @@
 {
-    "task_name": "LoS_NLoS_Classification",
+    "task_name": "los_nlos_classification",
     "scenario_name": "city_18_denver",
     "train_ratios": [
         0.001,
-        0.01,
-        0.05,
-        0.1,
-        0.25,
-        0.5,
-        0.8
+        0.010,
+        0.050,
+        0.100,
+        0.250,
+        0.500,
+        1.000
     ],
     "snr_range": [
+        -25,
         -20,
         -15,
         -10,
@@ -19,7 +20,8 @@
         5,
         10,
         15,
-        20
+        20,
+        25
     ],
     "task_complexity": null,
     "batch_size": 32,

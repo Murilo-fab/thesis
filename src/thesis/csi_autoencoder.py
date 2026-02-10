@@ -1,23 +1,47 @@
-import csv
+"""
+CSI Autoencoder Pre-training Script.
+
+This script trains a Convolutional Autoencoder (CAE) to compress and denoise 
+Channel State Information (CSI) matrices. 
+
+Key Features:
+1. Multi-City Training: Aggregates data from multiple DeepMIMO scenarios to ensure generalization.
+2. Physics-Aware Denoising: Uses a fixed noise floor (based on system reference power) 
+   during training to teach the AE to handle path loss and thermal noise correctly.
+3. NMSE Loss: Optimizes for Normalized Mean Squared Error.
+
+Author: Murilo Ferreira Alves Batista - RWTH Aachen/USP
+"""
+
+# --- 1. Standard Library Imports ---
 import os
+import csv
 import time
 from datetime import datetime
-from dataclasses import dataclass
 
+# --- 2. Third-Party Imports ---
 import numpy as np
 import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from thesis.data_classes import AutoEncoderConfig
 
+# --- 3. Local Imports ---
 import DeepMIMOv3
-from thesis.utils import get_parameters
+from thesis.utils import get_parameters, apply_awgn
+
+# -----------------------------------------------------------------------------
+# MODEL ARCHITECTURE
+# -----------------------------------------------------------------------------
 
 class RefineBlock(nn.Module):
     """
-    A Residual Block that refines features without changing their size.
-    Input: (B, C, H, W) -> Output: (B, C, H, W)
+    A Residual Block that refines features without changing spatial dimensions.
+    Used in the Decoder to reconstruct fine details.
+    
+    Shape: (B, C, H, W) -> (B, C, H, W)
     """
     def __init__(self, channels):
         super().__init__()
@@ -33,42 +57,50 @@ class RefineBlock(nn.Module):
     def forward(self, x):
         residual = x
         out = self.net(x)
-        # Add residual connection
         return self.relu(out + residual)
 
 class CSIAutoEncoder(nn.Module):
+    """
+    Convolutional Autoencoder for CSI Compression and Denoising.
+    
+    Input: Complex CSI (B, Tx, Subcarriers) -> Treated as 2-channel image (Real, Imag).
+    Latent: Compressed vector (B, Latent_Dim).
+    Output: Reconstructed Complex CSI.
+    """
     def __init__(self, latent_dim=64, mode="inference"):
         super().__init__()
         self.mode = mode
         
-        # Encoder
+        # --- Encoder ---
+        # Input: (B, 2, 32, 32)
         self.input_norm = nn.BatchNorm2d(2)
         self.encoder = nn.Sequential(
             nn.Conv2d(2, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), # Extra depth
+            
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2), # 32->16
+            nn.MaxPool2d(2), # -> (B, 64, 16, 16)
             
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2), # 16->8
+            nn.MaxPool2d(2), # -> (B, 128, 8, 8)
             
-            nn.Flatten()
+            nn.Flatten()     # -> (B, 128*8*8) = (B, 8192)
         )
         
-        # Calculate flat size (128 * 8 * 8)
         self.flat_dim = 128 * 8 * 8
         self.fc_enc = nn.Linear(self.flat_dim, latent_dim)
         
-        # Decoder
+        # --- Decoder ---
         self.fc_dec = nn.Linear(latent_dim, self.flat_dim)
         
         self.decoder_initial = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1), # 8->16
+            # Unflatten happens in forward
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1), # -> (B, 64, 16, 16)
             nn.BatchNorm2d(64),
             nn.ReLU()
         )
@@ -79,42 +111,38 @@ class CSIAutoEncoder(nn.Module):
         )
         
         self.decoder_final = nn.Sequential(
-            nn.ConvTranspose2d(64, 2, kernel_size=3, stride=2, padding=1, output_padding=1), # 16->32
+            nn.ConvTranspose2d(64, 2, kernel_size=3, stride=2, padding=1, output_padding=1), # -> (B, 2, 32, 32)
         )
 
     def load_weights(self, path, device="cpu"):
-        """
-        Safely loads model weights from a .pth file.
-        
-        Args:
-            path (str): Path to the .pth file.
-            device (str): 'cpu' or 'cuda'.
-        """
-        import os
-        
+        """Safely loads model weights from a .pth file."""
         if not os.path.exists(path):
             raise FileNotFoundError(f"Weights file not found: {path}")
             
         try:
-            # map_location allows loading GPU-trained models on CPU
             state_dict = torch.load(path, map_location=device)
-            
-            # Handle standard vs DataParallel keys (remove 'module.' prefix if present)
+            # Handle DataParallel keys
             if list(state_dict.keys())[0].startswith("module."):
                 state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
                 
             self.load_state_dict(state_dict)
             self.to(device)
             self.eval()
-            
+            print(f"Weights loaded from {path}")
         except RuntimeError as e:
-            print(f"Error loading weights: {e}")
-            print(f"Ensure the model latent_dim matches the checkpoint.")
+            print(f"Error loading weights: {e}. Check latent_dim config.")
             raise e
 
     def forward(self, x):
-        # 1. Norm
-        x_real = torch.stack([x.real, x.imag], dim=1).float()
+        """
+        Args:
+            x (Tensor): Complex input [B, Tx, SC]
+        Returns:
+            If mode='inference': z (Latent Vector)
+            If mode='train': (z, x_recon)
+        """
+        # 1. Preprocess: Complex -> 2-Channel Real
+        x_real = torch.stack([x.real, x.imag], dim=1).float() # (B, 2, Tx, SC)
         x_norm = self.input_norm(x_real)
         
         # 2. Encode
@@ -125,214 +153,142 @@ class CSIAutoEncoder(nn.Module):
             return z
         
         # 3. Decode
-        # Expand Latent
         x_recon = self.fc_dec(z).view(-1, 128, 8, 8)
+        x_recon = self.decoder_initial(x_recon)
+        x_recon = self.refine1(x_recon)
+        x_recon = self.decoder_final(x_recon)
         
-        # Upsample 1
-        x_recon = self.decoder_initial(x_recon) # (B, 64, 16, 16)
-        
-        # Refine (Residual)
-        x_recon = self.refine1(x_recon)         # (B, 64, 16, 16) - Cleaner
-        
-        # Upsample 2 (Final Projection)
-        x_recon = self.decoder_final(x_recon)   # (B, 2, 32, 32)
-        
+        # 4. Postprocess: 2-Channel Real -> Complex
         return z, torch.complex(x_recon[:,0], x_recon[:,1])
-    
-@dataclass
-class TrainingConfig:
-    TASK_NAME = "csi_autoencoder_training"
 
-    # 1. Curriculum
-    # Train: Mix of 5 diverse cities to learn general physics
-    TRAIN_CITIES = [
-        "city_7_sandiego", 
-        "city_11_santaclara", 
-        "city_12_fortworth", 
-        "city_15_indianapolis",
-        "city_19_oklahoma" 
-    ]
-    
-    # Val: Check convergence (Unseen during gradient updates)
-    VAL_CITY = ["city_18_denver"] 
-    
-    # Test
-    TEST_CITY = ["city_6_miami"]
+# -----------------------------------------------------------------------------
+# DATA UTILITIES
+# -----------------------------------------------------------------------------
 
-    # 2. Physics & Model
-    SCALE_FACTOR = 1e6
-    LATENT_DIM = 64
-    
-    # 3. Training
-    BATCH_SIZE = 128 
-    EPOCHS = 400      
-    LR = 1e-3
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-    MODELS_DIR = "./models"
-    RESULTS_BASE = "./results/"
-
-class DeepMIMOGenerator:
+class MultiCityGenerator:
     """
     Aggregates data from multiple DeepMIMO scenarios into a single dataset.
+    This creates a diverse training set for the Autoencoder.
     """
-    def __init__(self, scenario_list, scale_factor=1e6):
+    def __init__(self, scenario_list: list, scale_factor: float = 1e6):
         self.scenario_list = scenario_list
         self.scale_factor = scale_factor
 
     def load_all(self):
+        """
+        Iterates through the city list, loads valid users, and concatenates tensors.
+        Returns:
+            master_X (Tensor): [N_Total, Tx, SC]
+            master_y (Tensor): [N_Total] (LoS labels, unused for AE but kept for consistency)
+        """
         all_chs = []
-        all_labels = [] # LoS/NLoS labels
+        all_labels = [] 
         
-        print(f"Loading Multi-Scenario Dataset ({len(self.scenario_list)} cities)")
+        print(f"Loading Multi-Scenario Dataset ({len(self.scenario_list)} cities)...")
         
         for scenario_name in self.scenario_list:
-            print(f"\tProcessing {scenario_name}...", end=" ")
+            print(f"  > Processing {scenario_name}...", end=" ")
             try:
-                # 1. Get parameters
+                # 1. Get parameters & Generate
                 params = get_parameters(scenario_name) 
-                
-                # 2. Generate
                 deepmimo_data = DeepMIMOv3.generate_data(params)
                 
-                # 3. Filter Valid
+                # 2. Filter Valid Users
                 los = deepmimo_data[0]['user']['LoS']
                 valid_idx = np.where(los != -1)[0]
                 
                 raw_chs = deepmimo_data[0]['user']['channel'][valid_idx]
                 
-                # 4. Squeeze Rx Dim (if 1x32x32 -> 32x32)
+                # 3. Squeeze Rx Dim (1 -> None)
                 if raw_chs.ndim == 4:
                     raw_chs = raw_chs.squeeze(axis=1)
                 
-                # 5. Convert & Scale
+                # 4. Convert & Scale
                 t_chs = torch.tensor(raw_chs, dtype=torch.complex64) * self.scale_factor
                 t_lbl = torch.tensor(los[valid_idx], dtype=torch.long)
                 
                 all_chs.append(t_chs)
                 all_labels.append(t_lbl)
-                print(f"Done. (+{len(t_chs)} samples)")
+                print(f"Success. (+{len(t_chs)} samples)")
                 
             except Exception as e:
-                print(f"FAILED! {e}")
+                print(f"FAILED! Error: {e}")
                 
-        # 6. Concatenate everything
+        # 5. Concatenate & Shuffle
         if not all_chs:
             raise ValueError("No data loaded from any scenario!")
             
         master_X = torch.cat(all_chs, dim=0)
         master_y = torch.cat(all_labels, dim=0)
         
-        # 7. Global Shuffle
+        # Shuffle
         perm = torch.randperm(len(master_X))
         
-        print(f"Total Dataset: {len(master_X)} samples. Shape: {master_X.shape} ---")
+        print(f"--- Total Dataset: {len(master_X)} samples. Shape: {master_X.shape} ---")
         return master_X[perm], master_y[perm]
-    
-
-def add_awgn(x_clean, min_snr_db=0.0, max_snr_db=20.0):
-    """
-    Adds Additive White Gaussian Noise (AWGN) to a batch of complex channels.
-    
-    Args:
-        x_clean: (Batch, ...) Complex Tensor
-        min_snr_db, max_snr_db: Range of SNR to sample from uniformly.
-    """
-    B = x_clean.shape[0]
-    device = x_clean.device
-    
-    # 1. Random SNR for each sample in the batch
-    snr_db = torch.empty(B, 1, 1, device=device).uniform_(min_snr_db, max_snr_db)
-    snr_linear = 10 ** (snr_db / 10.0)
-    
-    # 2. Calculate Signal Power per sample
-    # Flatten dimensions for power calc: (Batch, ...) -> (Batch, -1)
-    flat = x_clean.reshape(B, -1)
-    sig_power = torch.mean(flat.abs()**2, dim=1).reshape(B, 1, 1)
-    
-    # 3. Calculate Noise Power & Std
-    noise_power = sig_power / snr_linear
-    # Divide by 2 because noise splits into Real and Imag parts
-    noise_std = torch.sqrt(noise_power / 2)
-    
-    # 4. Generate Complex Noise
-    noise = (torch.randn_like(x_clean.real) * noise_std) + \
-            1j * (torch.randn_like(x_clean.imag) * noise_std)
-            
-    return x_clean + noise
 
 class NMSELoss(nn.Module):
+    """
+    Normalized Mean Squared Error (NMSE) Loss.
+    NMSE = ||H - H_hat||^2 / ||H||^2
+    """
     def __init__(self):
         super().__init__()
 
     def forward(self, x_recon, x_target):
-        """
-        Calculates NMSE between reconstructed and target channels.
+        # Error Power: || H - H_hat ||^2
+        # Sum over (Channels, H, W) -> dims [1, 2, 3] if input is 4D
+        # For complex input [B, Tx, SC], we handle real/imag separate or together.
+        # Here input is expected to be stacked real/imag: [B, 2, Tx, SC]
         
-        Args:
-            x_recon: (Batch, ...) Complex or Real Tensor
-            x_target: (Batch, ...) Complex or Real Tensor
-        """
-        # 1. Calculate Error Power: || H - H_hat ||^2
         diff = x_target - x_recon
-        # Sum over all dimensions except Batch (dim 0)
-        # abs() works for both complex and real
-        error_power = torch.sum(diff.abs()**2, dim=[1, 2, 3]) 
+        error_power = torch.sum(diff**2, dim=[1, 2, 3]) 
         
-        # 2. Calculate Signal Power: || H ||^2
-        sig_power = torch.sum(x_target.abs()**2, dim=[1, 2, 3])
+        # Signal Power: || H ||^2
+        sig_power = torch.sum(x_target**2, dim=[1, 2, 3])
         
-        # 3. NMSE per sample
-        # Add epsilon for stability (prevent division by zero for silence)
-        nmse = error_power / (sig_power + 1e-10)
+        # NMSE per sample
+        nmse = error_power / (sig_power + 1e-12)
         
-        # 4. Return Mean NMSE over batch
         return torch.mean(nmse)
 
-def train_model(model, train_loader, val_loader, config):
+# -----------------------------------------------------------------------------
+# EXECUTION
+# -----------------------------------------------------------------------------
+
+def train_model(model, train_loader, val_loader, config, ref_power):
     """
-    Trains the Autoencoder with customized CSV logging and folder structures.
+    Training loop with Physics-Compliant Denoising.
+    
+    Args:
+        ref_power (float): System reference power derived from training set.
+                           Used to calculate fixed noise floor.
     """
     device = config.DEVICE
     model.to(device)
     
-    # 1. Setup Directories & Paths
+    # 1. Setup Logging
     time_now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    
-    # Results Folder: e.g. results/csi_autoencoder_training_64/2023-10-25_14-30-00
     task_id = f"{config.TASK_NAME}_{config.LATENT_DIM}"
     results_folder = os.path.join(config.RESULTS_BASE, task_id, time_now)
     os.makedirs(results_folder, exist_ok=True)
-    
-    # Models Folder: Ensure the base model directory exists
     os.makedirs(config.MODELS_DIR, exist_ok=True)
     
-    # Paths
     log_file = os.path.join(results_folder, "training_log.csv")
-    
-    # Model Save Path: models/csi_autoencoder_64.pth
     model_save_path = os.path.join(config.MODELS_DIR, f"csi_autoencoder_{config.LATENT_DIM}.pth")
     
-    print(f"Starting Training: {task_id}")
-    print(f"Logging to: {log_file}")
-    print(f"Best Model will be saved to: {model_save_path}")
-
-    # 2. Initialize CSV
-    headers = ["Epoch", "Train Loss", "Validation Loss", "Learning Rate", "Time"]
+    print(f"\nStarting Training: {task_id}")
+    print(f"Ref Power: {ref_power:.6e}")
     
+    # Initialize CSV
     with open(log_file, mode='w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow(headers)
+        writer.writerow(["Epoch", "Train NMSE", "Val NMSE", "Learning Rate", "Time"])
 
-    # 3. Optimization Setup
+    # 2. Optimizer
     opt = optim.Adam(model.parameters(), lr=config.LR)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        opt, 
-        mode='min', 
-        factor=0.5, 
-        patience=20,
-        cooldown=5,
-        min_lr=1e-6
+        opt, mode='min', factor=0.5, patience=20, cooldown=5, min_lr=1e-6
     )
     criterion = NMSELoss()
     
@@ -342,23 +298,33 @@ def train_model(model, train_loader, val_loader, config):
     start_time = time.time()
     
     for epoch in range(config.EPOCHS):
-        # TRAIN STEP
+        # --- TRAIN STEP ---
         model.train()
         train_loss_sum = 0
         
         for batch in train_loader:
             x_clean = batch[0].to(device)
             
-            # Dynamic Denoising
-            with torch.no_grad():
-                x_noisy = add_awgn(x_clean, min_snr_db=0, max_snr_db=20)
+            # Physics-Compliant Denoising Training
+            # We want the AE to learn to denoise a range of SNRs.
+            # Sample SNR uniformly from [0, 20] dB for this batch.
+            batch_snr_db = np.random.uniform(0, 20)
+            
+            # Calculate Noise Floor based on Fixed Reference Power
+            snr_linear = 10 ** (batch_snr_db / 10.0)
+            noise_power = ref_power / snr_linear
+            
+            # Apply Noise
+            x_noisy = apply_awgn(x_clean, noise_power)
             
             # Forward & Loss
-            _, x_recon = model(x_noisy)
-            loss = criterion(
-                torch.stack([x_recon.real, x_recon.imag], dim=1), 
-                torch.stack([x_clean.real, x_clean.imag], dim=1)
-                )
+            _, x_recon_complex = model(x_noisy)
+            
+            # Convert to stacked real/imag for NMSE loss calculation
+            recon_stacked = torch.stack([x_recon_complex.real, x_recon_complex.imag], dim=1)
+            clean_stacked = torch.stack([x_clean.real, x_clean.imag], dim=1)
+            
+            loss = criterion(recon_stacked, clean_stacked)
             
             opt.zero_grad()
             loss.backward()
@@ -368,7 +334,7 @@ def train_model(model, train_loader, val_loader, config):
             
         avg_train_loss = train_loss_sum / len(train_loader)
         
-        # VALIDATION STEP
+        # --- VALIDATION STEP ---
         model.eval()
         val_loss_sum = 0
         
@@ -376,49 +342,42 @@ def train_model(model, train_loader, val_loader, config):
             for batch in val_loader:
                 x_clean = batch[0].to(device)
                 
-                # Fixed SNR for validation
-                x_noisy_val = add_awgn(x_clean, min_snr_db=10, max_snr_db=10)
+                # Test at a fixed SNR (e.g., 10dB) for consistent validation metric
+                val_snr_linear = 10 ** (10.0 / 10.0)
+                val_noise_power = ref_power / val_snr_linear
+                x_noisy_val = apply_awgn(x_clean, val_noise_power)
                 
-                _, x_recon = model(x_noisy_val)
-                loss = criterion(
-                    torch.stack([x_recon.real, x_recon.imag], dim=1), 
-                    torch.stack([x_clean.real, x_clean.imag], dim=1)
-                    )
+                _, x_recon_complex = model(x_noisy_val)
+                
+                recon_stacked = torch.stack([x_recon_complex.real, x_recon_complex.imag], dim=1)
+                clean_stacked = torch.stack([x_clean.real, x_clean.imag], dim=1)
+                
+                loss = criterion(recon_stacked, clean_stacked)
                 val_loss_sum += loss.item()
                 
         avg_val_loss = val_loss_sum / len(val_loader)
-
         current_lr = opt.param_groups[0]['lr']
-
         scheduler.step(avg_val_loss)
         
-        # LOGGING
+        # --- LOGGING ---
         total_elapsed = time.time() - start_time
         time_str = f"{total_elapsed:.2f}s"
-
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         
-        print(f"Epoch {epoch+1:02d} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f} | Time: {time_str}")
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1:03d} | Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f} | Time: {time_str}")
         
-        # Write to CSV
         with open(log_file, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                epoch + 1,               # Epoch
-                f"{avg_train_loss:.6f}", # Train Loss
-                f"{avg_val_loss:.6f}",   # Validation Loss
-                f"{current_lr:.1e}",     # Learning Rate
-                time_str                 # Time
-            ])
+            csv.writer(file).writerow([epoch + 1, f"{avg_train_loss:.6f}", f"{avg_val_loss:.6f}", f"{current_lr:.1e}", time_str])
         
-        # Save Best Model
+        # Save Best
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), model_save_path)
-            print(f"\tNew Best Model Saved (Val: {best_val_loss:.6f})")
+            # print(f"\tNew Best Model Saved")
 
-    # FINALIZATION
+    # Finalization
     print("\nTraining Complete.")
     print(f"Loading best weights from {model_save_path}...")
     model.load_state_dict(torch.load(model_save_path))
@@ -426,41 +385,52 @@ def train_model(model, train_loader, val_loader, config):
     return model, history, results_folder
 
 def plot_training_history(history, save_dir=None):
-    """
-    Plots the Training and Validation Loss (NMSE) from the history dictionary.
-    
-    Args:
-        history (dict): Dictionary containing 'train_loss' and 'val_loss' lists.
-        save_dir (str, optional): Directory to save the plot image. If None, just shows it.
-    """
-    train_loss = history['train_loss']
-    val_loss = history['val_loss']
-    epochs = range(1, len(train_loss) + 1)
-
+    """Plots Training and Validation NMSE."""
     plt.figure(figsize=(10, 6))
+    epochs = range(1, len(history['train_loss']) + 1)
     
-    # Plot Lines
-    plt.plot(epochs, train_loss, 'b-o', label='Training NMSE', linewidth=2, markersize=4)
-    plt.plot(epochs, val_loss, 'r-s', label='Validation NMSE', linewidth=2, markersize=4)
+    plt.plot(epochs, history['train_loss'], label='Training NMSE')
+    plt.plot(epochs, history['val_loss'], label='Validation NMSE')
     
-    # Styling
-    plt.title('CSI Autoencoder Training Progress', fontsize=16)
-    plt.xlabel('Epochs', fontsize=12)
-    plt.ylabel('NMSE Loss (Normalized)', fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True, which='both', linestyle='--', alpha=0.7)
+    plt.title('CSI Autoencoder Training Progress')
+    plt.xlabel('Epochs')
+    plt.ylabel('NMSE Loss')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
     
-    plt.yscale('log') 
-    
-    plt.tight_layout()
-
-    # Save or Show
     if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, "loss_curve.png")
-        plt.savefig(save_path, dpi=300)
-        print(f"Plot saved to: {save_path}")
+        plt.savefig(os.path.join(save_dir, "training_curve.png"))
+        print("Training plot saved.")
     else:
         plt.show()
+
+# -----------------------------------------------------------------------------
+# ENTRY POINT
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    config = AutoEncoderConfig()
     
-    plt.close()
+    # 1. Load Data
+    train_gen = MultiCityGenerator(config.TRAIN_CITIES, config.SCALE_FACTOR)
+    val_gen = MultiCityGenerator(config.VAL_CITY, config.SCALE_FACTOR)
+    
+    X_train, _ = train_gen.load_all()
+    X_val, _ = val_gen.load_all()
+    
+    train_dl = DataLoader(TensorDataset(X_train), batch_size=config.BATCH_SIZE, shuffle=True)
+    val_dl = DataLoader(TensorDataset(X_val), batch_size=config.BATCH_SIZE, shuffle=False)
+    
+    # 2. Physics Calibration (Global Reference Power)
+    # Calculate average power of the training set to set the Noise Floor baseline
+    ref_power = torch.mean(torch.abs(X_train)**2).item()
+    
+    # 3. Model
+    model = CSIAutoEncoder(latent_dim=config.LATENT_DIM, mode="train")
+    
+    # 4. Train
+    best_model, history, res_folder = train_model(model, train_dl, val_dl, config, ref_power)
+    
+    # 5. Visualize
+    plot_training_history(history, save_dir=res_folder)

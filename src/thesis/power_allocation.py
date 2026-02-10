@@ -1,377 +1,680 @@
+"""
+Power Allocation (Sum-Rate Maximization) Task.
+
+This script benchmarks Deep Learning models against traditional wireless baselines 
+(WMMSE/FP, Zero-Forcing, Equal Power) for the Power Allocation problem.
+
+It evaluates:
+1. Sum-Rate Capacity (bps/Hz).
+2. Data Efficiency: Performance vs. Training Size.
+3. Noise Robustness: Performance vs. SNR (using fixed noise floor physics).
+4. Computational Complexity.
+
+Author: Murilo Ferreira Alves Batista - RWTH Aachen/USP
+"""
+
+# --- 1. Standard Library Imports ---
+import os
+import csv
+import time
+import copy
+from datetime import datetime
+
+# --- 2. Third-Party Imports ---
+import numpy as np
+import pandas as pd
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import MultiStepLR
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.manifold import TSNE
+from tqdm import tqdm
+import DeepMIMOv3
 
-epsilon = 1e-18
+# --- 3. Local Imports ---
+from thesis.data_classes import TaskConfig
+from thesis.downstream_models import build_model_from_config
+from thesis.utils import (
+    get_parameters, 
+    create_dataloaders, 
+    get_flops_and_params, 
+    get_latency, 
+    get_subset, 
+    apply_awgn
+)
 
-def solve_water_filling(gains, P_total=1.0, noise_variance=1.0):
+import warnings
+warnings.filterwarnings('ignore')
+
+# -----------------------------------------------------------------------------
+# CLASS: DeepMIMO Generator (Power Allocation Variant)
+# -----------------------------------------------------------------------------
+
+class DeepMIMOGenerator:
     """
-    Solver for Water Filling
+    Handles data generation for Power Allocation.
     
-    Inputs:
-        gains (torch.tensor): Gains tensor [B, S, K]
-        P_total (float): Total power for the system
-
-    Output:
-        power (torch.tensor): Power tensor [B, S, K]
-    """
-    # 1. Flatten dimensions 
-    # Treat all users and subcarriers as a list of independent parallel channels.
-    # Shape: (B, S, K) : (B, S*K)
-    B, S, K = gains.shape
-    flat_gains = gains.view(B, S * K)
-
-    # 2. Clamps small gains to increase numerical stability
-    flat_gains = torch.clamp(flat_gains, min=epsilon)
-
-    # 3. Calculate noise levels
-    noise_levels = noise_variance / flat_gains
-
-    # 4. Sort noise levels from low to high / good to bad channels
-    sorted_noise, indices = torch.sort(noise_levels, dim=-1)
-
-    # 5. Calculate the cumulative sum of noises for k=1, k=2, k=3...
-    cum_noise = torch.cumsum(sorted_noise, dim=-1)
-
-    num_channels = S * K
-    k_range = torch.arange(1, num_channels + 1, device=gains.device).view((1, num_channels))
-
-    # 6. Calculates the water level mu for every possible number of active channels
-    mu_candidates = (P_total + cum_noise) / k_range
-
-    # 7. Check if the water level is greater than the noise floor for the k-th user
-    valid = mu_candidates > sorted_noise
-
-    # 8. Finds the max k that satisfy the criterion
-    # We clamp min=1 to prevent k_optimal being 0. 
-    # This prevents the index from ever being -1.
-    k_optimal = torch.sum(valid, dim=-1, keepdim=True).clamp(min=1)
+    Features:
+    - Generates user groups based on spatial correlation and gain ratio constraints.
+    - Ensures valid user pairing for Multi-User MIMO scenarios.
     
-    # 9. Selects the correct mu
-    k_idx = k_optimal - 1
-    mu_selected = torch.gather(mu_candidates, -1, k_idx)
-
-    # 10. Calculates power: P = mu - noise
-    sorted_powers = torch.clamp(mu_selected - sorted_noise, min=0)
-
-    # 11. Restore the original order
-    flat_powers = torch.zeros_like(flat_gains)
-    flat_powers.scatter_(-1, indices, sorted_powers)
-
-    powers = flat_powers.view(B, S, K)
-
-    return powers
-
-def apply_water_filling(W, H, P_total=1.0, noise_variance=1.0):
+    Attributes:
+        params (dict): DeepMIMO parameters.
+        scale_factor (float): Normalization factor for channel matrices.
     """
-    Apply Water Filling to optimize the power allocation for a precoder
+    def __init__(self, scenario_name: str = 'city_6_miami', scale_factor: float = 1e6):
+        self.scenario_name = scenario_name
+        self.scale_factor = scale_factor
+
+        self.params = get_parameters(scenario_name)
+        self.n_subcarriers = self.params['OFDM']['subcarriers']
+        self.n_ant_bs = self.params['bs_antenna']['shape'][0]
+
+        # Pre-load data once
+        self.all_channels, self.num_total_users, self.all_locations = self.get_channels()
+        self.user_gains, self.h_spatial = self.get_matrices()
     
-    Inputs:
-        W (torch.tensor): Initial precoder [B, S, N, K]
-        H (torch.tensor): Channel tensor [B, S, K, N]
-        P_total (float): Total power for the system
+    def get_channels(self) -> tuple[np.ndarray, int, np.ndarray]:
+        """Loads and cleans raw DeepMIMO data."""
+        deepmimo_data = DeepMIMOv3.generate_data(self.params)
 
-    Output:
-        W (torch.tensor): Refined precoder with optimal power [B, S, N, K]
-    """
+        # Filter Valid Users (LoS != -1)
+        idxs = np.where(deepmimo_data[0]['user']['LoS'] != -1)[0]
+        
+        cleaned_deepmimo_data = deepmimo_data[0]['user']['channel'][idxs]
+        cleaned_deepmimo_locs = deepmimo_data[0]['user']['location'][idxs]
+        
+        # Remove UE antenna dim: (K, 1, Tx, SC) -> (K, Tx, SC)
+        all_channels = cleaned_deepmimo_data.squeeze() * self.scale_factor
+        num_total_users = all_channels.shape[0]
 
-    # 1. Extract directions
-    # Normalize the columns of W to unit form
-    V_directions = torch.nn.functional.normalize(W, p=2, dim=-2, eps=epsilon)
-
-    # 2. Calculate "effective channel" with those directions (H @ V)
-    # Shape: (B, S, K, N) @ (B, S, N, K) : (B, S, K, K)
-    H_eff = H @ V_directions
-
-    # 3. Get the gains from the "effective channel"
-    signal_amplitudes = torch.diagonal(H_eff, dim1=-2, dim2=-1)
-    effective_gains = torch.abs(signal_amplitudes)**2
-
-    # 4. Solve Water Filling 
-    optimal_powers = solve_water_filling(effective_gains, P_total, noise_variance)
-
-    # 5. Apply new powers
-    W_opt = V_directions * torch.sqrt(optimal_powers.unsqueeze(-2))
-
-    return W_opt
-
-def mrt_precoder(H: torch.tensor, P_total=1.0):
-    """
-    Normalized MRT Precoder for a Multi-Carrier MU-MIMO system.
+        return all_channels, num_total_users, cleaned_deepmimo_locs
     
-    Inputs:
-        H (torch.tensor): Channel tensor [B, S, K, N]
-        P_total (float): Total power for the system
+    def get_matrices(self) -> tuple[np.ndarray, np.ndarray]:
+        """Calculates gains and spatial signatures for user selection."""
+        # 1. Gains (Average Power)
+        user_gains = np.linalg.norm(self.all_channels, axis=(1, 2))**2 / self.n_subcarriers
 
-    Output:
-        W (torch.tensor): Normalized Precoder [B, S, N, K]
-    """
+        # 2. Spatial Signatures (Normalized Center Subcarrier)
+        mid_sub = self.n_subcarriers // 2
+        h_spatial_raw = self.all_channels[:, :, mid_sub]
+        norms = np.linalg.norm(h_spatial_raw, axis=1, keepdims=True)
+        h_spatial = h_spatial_raw / (norms + 1e-9)
 
-    # 1. MRT precoder is the conjugate transpose of H
-    W_raw = H.transpose(-2, -1).conj()
+        return user_gains, h_spatial
 
-    # 2. Normalize
-    mag_squared = torch.abs(W_raw)**2
-    system_energy = torch.sum(mag_squared, dim=(-3, -2, -1), keepdim=True)
-    scaling_factor = torch.sqrt(P_total / system_energy)
+    def get_valid_mask_for_user(self, target_user_idx, min_corr, max_corr, max_gain_ratio):
+        """Finds users compatible with the target user (Correlation & Gain checks)."""
+        # Correlation check
+        target_vec = self.h_spatial[target_user_idx]
+        corrs = np.abs(self.h_spatial @ target_vec.conj())
+        mask_corr = (corrs >= min_corr) & (corrs <= max_corr)
 
-    W_norm = W_raw * scaling_factor
+        # Gain Ratio check
+        target_gain = self.user_gains[target_user_idx]
+        all_gains = self.user_gains
+        g_min = np.minimum(target_gain, all_gains) + 1e-9
+        g_max = np.maximum(target_gain, all_gains)
+        ratios = g_max / g_min
+        mask_gain = ratios <= max_gain_ratio
 
-    return W_norm
-
-def get_mrt_directions(H):
-    """
-    Returns the Unit-Norm MRT Beamforming Directions
+        return mask_corr & mask_gain
     
-    Inputs:
-        H (torch.tensor): Channel matrix [B, S, K, N]
+    def generate_dataset(self, num_samples, num_users, min_corr=0.3, max_corr=0.8, max_gain_ratio=15.0):
+        """
+        Greedily samples groups of compatible users.
+        Returns:
+            dataset_H (Tensor): [Samples, Users, Tx, SC]
+        """
+        dataset_indices = []
+        pbar = tqdm(total=num_samples, desc="Generating User Groups")
 
-    Outputs:
-        V (torch.tensor) : Normalized directions [B, S, N, K]
-    """
-    # 1. Conjugate Transpose (Simple MRT)
-    # Shape: [B, S, N, K]
-    W_raw = H.transpose(-2, -1).conj()
-    
-    # 2. Normalize columns to length 1.0 (Pure Direction)
-    V_directions = torch.nn.functional.normalize(W_raw, p=2, dim=-2)
-    
-    return V_directions
-
-def zf_precoder(H: torch.tensor, P_total=1.0):
-    """
-    Calculates the Normalized ZF Precoder for a Multi-Carrier MU-MIMO system.
-
-    Inputs:
-        H (torch.tensor): Channel tensor [B, S, K, N]
-        P_total (float): Total power for the system
-
-    Output:
-        W (torch.tensor): Normalized Precoder [B, S, N, K]
-    """
-
-    # 1. Hermetian Transpose
-    H_hermitian = H.transpose(-2, -1).conj()
-
-    # 2. Gram Matrix
-    # Shape: (B, S, K, N) @ (B, S, N, K) : (B, S, K, K)
-    gram_matrix = H @ H_hermitian
-
-    # 3. Inverse
-    # For numerical stability, we add epsilon
-    eye = torch.eye(gram_matrix.shape[-1], device=H.device, dtype=H.dtype)
-    gram_matrix = gram_matrix + eye * epsilon
-
-    gram_inverse = torch.linalg.inv(gram_matrix)
-
-    # 4. Raw precoder
-    # Shape: (B, S, N, K) @ (B, S, K, K) : (B, S, N, K)
-    W_raw = H_hermitian @ gram_inverse
-
-    # 5. Normalization
-    mag_squared = torch.abs(W_raw)**2
-    system_energy = torch.sum(mag_squared, dim=(-3, -2, -1), keepdim=True)
-    scaling_factor = torch.sqrt(P_total / system_energy)
-
-    W_norm = W_raw * scaling_factor
-
-    return W_norm
-
-def get_zf_directions(H: torch.tensor):
-    """
-    Returns the Unit-Norm ZF Beamforming Directions
-    
-    Inputs:
-        H (torch.tensor): Channel matrix [B, S, K, N]
-
-    Outputs:
-        V (torch.tensor) : Normalized directions [B, S, N, K]
-    """
-    # 1. ZF calculation
-    H_hermitian = H.transpose(-2, -1).conj()
-
-    # 1.2 Inverse gram matrix
-    gram = H @ H_hermitian
-    eye = torch.eye(gram.shape[-1], device=H.device, dtype=H.dtype)
-    gram_inv = torch.linalg.inv(gram + eye * epsilon)
-
-    # 1.3 ZF Precoder
-    W_raw = H_hermitian @ gram_inv
-
-    # 2. Get ZF directions
-    V_directions = torch.nn.functional.normalize(W_raw, p=2, dim=-2)
-
-    return V_directions
-
-import torch
-
-def wmmse_solver(H,
-                       P_total: float = 1.0,
-                       noise_variance: float = 1e-10,
-                       iterations: int = 20):
-    """
-    WMMSE Solver with Global Power Constraint across Subcarriers.
-    
-    Inputs:
-        H (torch.Tensor): Channel Matrix Shape: [B, SC, K, N]
-        P_total (flaot): Total system power budget
-        noise_variance (float): Sigma^2
-        iterations (int)
-    """
-    # 1. Setup
-    # Ensure shape is [B, S, K, M]
-    if H.dim() == 3: # [B, K, M] -> Single Carrier
-        H = H.unsqueeze(1)
-        
-    B, S, K, M = H.shape
-    device = H.device
-    dtype = H.dtype
-
-    # 2. Random Initialization
-    # Random V: [B, S, N, K]
-    V = torch.randn(B, S, M, K, dtype=dtype, device=device)
-    
-    # Scale initial V to meet P_total exactly
-    # Calculate total power per batch sample (sum over S, M, K)
-    sys_power = torch.sum(torch.abs(V)**2, dim=(1, 2, 3), keepdim=True)
-    V = V * torch.sqrt(P_total / sys_power)
-    
-    # Identity matrix for regularization [1, 1, M, M]
-    I = torch.eye(M, device=device).view(1, 1, M, M)
-
-    # 3. Iteration loop
-    for it in range(iterations):
-        
-        # Step A: Receiver (U)
-        # H: [B, S, K, N], V: [B, S, N, K]
-        # HV: [B, S, K, K] -> Signal at Rx k from Tx j
-        HV = torch.matmul(H, V)
-        
-        # Signal Power (Diagonal)
-        Signal = torch.diagonal(HV, dim1=2, dim2=3) # [B, S, K]
-        
-        # Total Rx Power (Sum over transmitters) + Noise
-        Rx_Power = torch.sum(torch.abs(HV)**2, dim=3) + noise_variance # [B, S, K]
-        
-        # MMSE Receiver U: [B, S, K]
-        U = Signal.conj() / Rx_Power
-        
-        # Step B: Weights (W)
-        # MSE = 1 - u * signal
-        MSE = 1.0 - (U.conj() * Signal).real
-        MSE = torch.clamp(MSE, min=1e-6)
-        W = 1.0 / MSE # [B, S, K]
-
-        # Step C: Transmitter (V)
-        # Solve (A_s + mu * I)^-1 * B_s for every subcarrier s
-        # But mu is SHARED across s.
-        
-        # 1. Construct A_s (Covariance) per subcarrier
-        # scaler: sqrt(w) * |u|
-        scaler_A = torch.sqrt(W) * torch.abs(U) # [B, S, K]
-        H_scaled = H * scaler_A.unsqueeze(3)    # [B, S, K, M]
-        # A = H_scaled^H @ H_scaled -> [B, S, M, M]
-        A = torch.matmul(H_scaled.transpose(2, 3).conj(), H_scaled)
-        
-        # 2. Construct B_s (Target) per subcarrier
-        scaler_B = W * U # [B, S, K]
-        # B_target = H^H * diag(scaler) -> [B, S, M, K]
-        B_target = H.transpose(2, 3).conj() * scaler_B.unsqueeze(2)
-
-        # Global biscetion search for MU
-        # We search for a single scalar mu per batch item
-        
-        # Initial Bounds: [B, 1, 1, 1] for broadcasting
-        mu_min = torch.zeros(B, 1, 1, 1, device=device)
-        mu_max = torch.ones(B, 1, 1, 1, device=device) * 1000.0
-        
-        # 1. Check Unconstrained (mu=0)
-        # Solve A * V = B for all S concurrently
-        # A + epsilon*I to avoid singularity
-        V_try = torch.linalg.solve(A + epsilon*I, B_target)
-        
-        # Calculate SYSTEM Power: Sum over Subcarriers(1), Antennas(2), Users(3)
-        P_sys = torch.sum(torch.abs(V_try)**2, dim=(1, 2, 3), keepdim=True) # [B, 1, 1, 1]
-        
-        # Identify violators
-        mask_violation = (P_sys > P_total).float() # [B, 1, 1, 1]
-        
-        # 2. Bisection Loop (only affects violators due to masking later)
-        for _ in range(20):
-            mu = (mu_min + mu_max) / 2
+        attempts = 0
+        while len(dataset_indices) < num_samples:
+            # 1. Random Start
+            current_group = [np.random.randint(0, self.num_total_users - 1)]
             
-            # Apply shared mu to all subcarriers
-            A_reg = A + mu * I # [B, S, M, M] + [B, 1, M, M] -> [B, S, M, M]
-            
-            V_try = torch.linalg.solve(A_reg, B_target)
-            
-            # Check Global Power
-            P_current = torch.sum(torch.abs(V_try)**2, dim=(1, 2, 3), keepdim=True)
-            
-            # Update bounds
-            high_power = (P_current > P_total).float()
-            mu_min = high_power * mu + (1 - high_power) * mu_min
-            mu_max = high_power * mu_max + (1 - high_power) * mu
-            
-        # 3. Select Final V
-        # If unconstrained was valid, use it. Otherwise use bisection result.
-        # Recalculate V_try one last time with refined mu for violators
-        # (Or just use the last V_try from loop, which is close enough)
-        
-        # Re-solve one last time with the "best" mu found (mixed with 0 for non-violators)
-        mu_final = mask_violation * mu + (1 - mask_violation) * 0.0
-        A_final = A + mu_final * I
-        V_final = torch.linalg.solve(A_final, B_target)
-        
-        # Final safety clamp
-        # Ensure strict compliance with P_total
-        P_final_sys = torch.sum(torch.abs(V_final)**2, dim=(1, 2, 3), keepdim=True)
-        scale_factor = torch.min(torch.ones_like(P_final_sys), torch.sqrt(P_total / (P_final_sys + 1e-12)))
-        V = V_final * scale_factor
+            # 2. Init Candidates
+            candidate_mask = np.ones(self.num_total_users, dtype=bool)
+            candidate_mask[current_group[0]] = False
 
-    # 4. Return rates
-    HV = torch.matmul(H, V)
-    Signal_Power = torch.abs(torch.diagonal(HV, dim1=2, dim2=3))**2
-    Interference_Power = torch.sum(torch.abs(HV)**2, dim=3) - Signal_Power
-    SINR = Signal_Power / (Interference_Power + noise_variance)
-    
-    # Rate per subcarrier: [B, S, K]
-    Rate_SC = torch.log2(1 + SINR)
-    
-    Sum_Rate = torch.sum(torch.mean(Rate_SC, dim=1), dim=1)
+            group_failed = False
+            
+            # 3. Greedy Addition
+            for _ in range(num_users - 1):
+                last_added = current_group[-1]
+                step_mask = self.get_valid_mask_for_user(last_added, min_corr, max_corr, max_gain_ratio)
+                candidate_mask &= step_mask
+                
+                valid_indices = np.where(candidate_mask)[0]
+                if len(valid_indices) == 0:
+                    group_failed = True
+                    break
+                
+                next_user = np.random.choice(valid_indices)
+                current_group.append(next_user)
+                candidate_mask[next_user] = False
+            
+            if not group_failed:
+                dataset_indices.append(current_group)
+                pbar.update(1)
+            else:
+                attempts += 1
         
-    return Sum_Rate, V
+        pbar.close()
+        indices = np.array(dataset_indices)
+        dataset_H = self.all_channels[indices] 
+        dataset_gains = self.user_gains[indices]
+        dataset_locs = self.all_locations[indices]
 
-def calculate_sum_rate(H, W, noise_variance=1.0) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.tensor(dataset_H), dataset_gains, dataset_locs
+
+# -----------------------------------------------------------------------------
+# CLASS: Physics-Compliant Loss Function
+# -----------------------------------------------------------------------------
+
+class SumRateLoss(nn.Module):
     """
-    Calculate the Sum Rate for a precoder.
-    
-    Inputs:
-        H (torch.tensor): Channel tensor [B, S, K, N]
-        W (torch.tensor): Precoder tensor [B, S, N, K]
-        noise_variance (float): Noise variance (sigma^2)
-
-    Outputs:
-        sum_rate (torch.tensor): Sum-rate per subcarrier [B, S]
-        user_rates (torch.tensor): Sum-rate per user [B, S, K]
+    Differentiable Sum-Rate Calculation for Downlink MU-MIMO.
+    Assumes Maximum Ratio Transmission (MRT) Beamforming.
     """
+    def __init__(self, noise_power=1e-9):
+        super().__init__()
+        self.noise_power = noise_power
 
-    # 1. Calculate the effective channel (H @ W)
-    # Shape: (B, S, K, N) @ (B, S, N, K) : (B, S, K, K)
-    H_eff = H @ W
+    def forward(self, pred_powers, channels):
+        """
+        Args:
+            pred_powers (Tensor): [B, N] Normalized power allocation (Sum=1).
+            channels (Tensor):    [B, N, Tx, SC] Complex Channel Matrix.
+        """
+        B, N, Tx, SC = channels.shape
+        
+        # 1. Power Scaling: Model outputs total power fraction. 
+        # Divide by SC because the budget is shared across all subcarriers.
+        power_per_sc = pred_powers / SC 
+        
+        # 2. Vectorization: Merge Batch and Subcarrier dims for parallel computation
+        # (B, N, Tx, SC) -> (B*SC, N, Tx)
+        channels_folded = channels.permute(0, 3, 1, 2).reshape(B * SC, N, Tx)
+        
+        # Expand power: (B, N) -> (B*SC, N)
+        power_folded = power_per_sc.unsqueeze(1).repeat(1, SC, 1).reshape(B * SC, N)
 
-    # 2. Extract signal power (Diagonal of the effective channel matrix)
-    signal_power = torch.abs(torch.diagonal(H_eff, dim1=-2, dim2=-1))**2
+        # 3. MRT Precoding: w = h* / |h|
+        norms = torch.norm(channels_folded, dim=2, keepdim=True) + 1e-12
+        w_precoder = torch.conj(channels_folded) / norms 
+        
+        # Apply Power Amplitude: w_final = w * sqrt(p)
+        amplitudes = torch.sqrt(power_folded.unsqueeze(2) + 1e-12)
+        w_scaled = w_precoder * amplitudes
 
-    # 3. Extract the total received power (Signal + interference)
-    total_received_power = torch.sum(torch.abs(H_eff)**2, dim=-1)
+        # 4. Effective Channel: H * W^T
+        # Result[b, i, j] is signal from Tx-Beam j to User i
+        rx_signal_matrix = torch.matmul(channels_folded, w_scaled.transpose(1, 2))
+        rx_power_matrix = torch.abs(rx_signal_matrix) ** 2
 
-    # 4. Isolate interference
-    interference_power = total_received_power - signal_power
+        # 5. SINR Calculation
+        # Signal: Diagonal elements (intended user)
+        signal_power = torch.diagonal(rx_power_matrix, dim1=1, dim2=2)
+        
+        # Interference: Total Power - Signal Power
+        total_rx_power = torch.sum(rx_power_matrix, dim=2)
+        interference_power = torch.clamp(total_rx_power - signal_power, min=0.0)
 
-    # 5. Calculate SINR (Signal to Interference plus Noise Ratio)
-    sinr = signal_power / (interference_power + noise_variance + epsilon)
+        # Shannon Capacity
+        sinr = signal_power / (interference_power + self.noise_power + 1e-12)
+        rates_per_sc = torch.log2(1 + sinr) 
+        
+        # 6. Aggregation: Sum over Users and Subcarriers
+        sum_rate_per_tone = torch.sum(rates_per_sc, dim=1) 
+        sum_rate_matrix = sum_rate_per_tone.view(B, SC)
+        total_system_rate = torch.sum(sum_rate_matrix, dim=1)
 
-    # 6. Calculate rate
-    user_rates = torch.log2(1 + sinr + epsilon)
-    sum_rate = torch.sum(user_rates, dim=-1)
+        # Minimize negative rate
+        return -torch.mean(total_system_rate)
 
-    return sum_rate, user_rates
+# -----------------------------------------------------------------------------
+# CLASS: Benchmark Suite (Baselines & SNR Sweep)
+# -----------------------------------------------------------------------------
+
+class BenchmarkSuite:
+    def __init__(self, snr_levels, device='cpu'):
+        self.snr_levels = snr_levels
+        self.device = device
+
+    def _calculate_noise_power(self, ref_power, snr_db):
+        """Fixed Noise Floor calculation based on Reference Power."""
+        snr_linear = 10 ** (snr_db / 10.0)
+        return ref_power / snr_linear
+
+    def _compute_raw_rates_mrt(self, powers, channels, noise_power):
+        """Helper to compute Sum Rate for baselines (Shared MRT logic)."""
+        B, N, Tx, SC = channels.shape
+        
+        if powers.dim() == 2: 
+            P_broad = powers.reshape(B, N, 1, 1) / SC
+        else:
+            P_broad = powers / SC
+
+        total_rate = torch.zeros(B, device=self.device)
+
+        for k in range(SC):
+            H_k = channels[:, :, :, k]
+            
+            # MRT Math
+            Gram = torch.matmul(H_k, H_k.conj().transpose(1, 2))
+            MagSq = Gram.abs().pow(2) 
+            Norms = torch.diagonal(Gram, dim1=1, dim2=2).real 
+            Norms_broad = Norms.unsqueeze(1)
+            G_eff = MagSq / (Norms_broad + 1e-12)
+            
+            P_vec = P_broad.reshape(B, 1, N) 
+            Rx_Matrix = G_eff * P_vec
+            
+            Signal = torch.diagonal(Rx_Matrix, dim1=1, dim2=2)
+            Total_Rx = torch.sum(Rx_Matrix, dim=2)
+            Interference = torch.clamp(Total_Rx - Signal, min=0.0)
+            
+            SINR = Signal / (Interference + noise_power + 1e-12)
+            total_rate += torch.sum(torch.log2(1 + SINR), dim=1)
+            
+        return total_rate
+    
+    def _compute_zf_rates(self, channels, noise_power):
+        """Calculates Sum Rate for Zero-Forcing (ZF) Beamforming."""
+        B, N, Tx, SC = channels.shape
+        total_rate = torch.zeros(B, device=self.device)
+        tx_power_per_stream = 1.0 / (N * SC) # Equal power sharing
+
+        for k in range(SC):
+            H_k = channels[:, :, :, k]
+            # H_dag = (H^H H)^-1 H^H -> Pseudo Inverse
+            W_k = torch.linalg.pinv(H_k) 
+            
+            # Noise Enhancement Penalty (Power cost to invert channel)
+            penalty = torch.sum(W_k.abs()**2, dim=1) 
+            rx_sig = tx_power_per_stream / (penalty + 1e-12)
+            
+            sinr = rx_sig / (noise_power + 1e-12)
+            total_rate += torch.sum(torch.log2(1 + sinr), dim=1)
+            
+        return total_rate
+
+    def compute_baselines(self, test_loader, ref_power, num_restarts=20, pgd_steps=100):
+        """Runs Equal, ZF, and Optimal (PGD) baselines."""
+        noise_floors = {snr: self._calculate_noise_power(ref_power, snr) for snr in self.snr_levels}
+        results = {
+            "SNR": self.snr_levels,
+            "Equal": {snr: 0.0 for snr in self.snr_levels},
+            "ZF": {snr: 0.0 for snr in self.snr_levels},
+            "Optimal": {snr: 0.0 for snr in self.snr_levels}
+        }
+        
+        total_samples = 0
+        
+        for batch in test_loader:
+            bx = batch[0].to(self.device)
+            B, N = bx.shape[0], bx.shape[1]
+            total_samples += B
+
+            p_eq = torch.ones(B, N, device=self.device) / N
+
+            for snr in self.snr_levels:
+                current_noise = noise_floors[snr]
+                
+                # We do not use no_grad here because PGD optimization needs gradients
+                # However, for ZF and Eq, we can detach or just compute.
+                
+                # 1. Equal
+                r_eq = self._compute_raw_rates_mrt(p_eq, bx, current_noise)
+                results["Equal"][snr] += torch.sum(r_eq).item()
+                
+                # 2. ZF
+                r_zf = self._compute_zf_rates(bx, current_noise)
+                results["ZF"][snr] += torch.sum(r_zf).item()
+                
+                # 3. Optimal (PGD)
+                r_opt = self.run_optimization_solver(
+                    bx, steps=pgd_steps, num_restarts=num_restarts,
+                    noise_power=current_noise, return_powers=False
+                )
+                results["Optimal"][snr] += torch.sum(r_opt).item()
+
+        # Average
+        final_results = {"SNR": self.snr_levels, "Equal": [], "ZF": [], "Optimal": []}
+        for snr in self.snr_levels:
+            final_results["Equal"].append(results["Equal"][snr] / total_samples)
+            final_results["ZF"].append(results["ZF"][snr] / total_samples)
+            final_results["Optimal"].append(results["Optimal"][snr] / total_samples)
+            
+        return final_results
+
+    def run_model_benchmark(self, model, test_loader, ref_power):
+        """Evaluates AI Model robustness against Fixed Noise."""
+        model.eval()
+        
+        noise_floors = {snr: self._calculate_noise_power(ref_power, snr) for snr in self.snr_levels}
+        snr_sums = {snr: 0.0 for snr in self.snr_levels}
+        total_samples = 0
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                bx_clean = batch[0].to(self.device)
+                total_samples += bx_clean.size(0)
+
+                for snr in self.snr_levels:
+                    current_noise = noise_floors[snr]
+
+                    # 1. Create Noisy Input (Simulation)
+                    bx_noisy = apply_awgn(bx_clean, current_noise)
+
+                    # 2. Inference
+                    logits = model(bx_noisy)
+                    pred_powers = torch.softmax(logits, dim=1)
+
+                    # 3. Rate Calculation (Real Physics)
+                    rates = self._compute_raw_rates_mrt(pred_powers, bx_clean, current_noise)
+                    snr_sums[snr] += torch.sum(rates).item()
+                    
+        ai_results = []
+        for snr in self.snr_levels:
+            ai_results.append(snr_sums[snr] / total_samples)
+            
+        return {"SNR": self.snr_levels, "model": ai_results}
+
+    def run_optimization_solver(self, channels, steps=100, num_restarts=20, 
+                              noise_power=None, return_powers=False):
+        """Projected Gradient Descent (PGD) to find Optimal Power allocation."""
+        B, N = channels.shape[0], channels.shape[1]
+        if noise_power is None: noise_power = 1e-9
+
+        # Expand for Restarts
+        channels_exp = channels.repeat_interleave(num_restarts, dim=0)
+        
+        # Init Variables
+        opt_logits = torch.randn(B * num_restarts, N, device=self.device, requires_grad=True)
+        optimizer = optim.Adam([opt_logits], lr=0.1)
+        
+        for _ in range(steps):
+            optimizer.zero_grad()
+            p_cand = torch.softmax(opt_logits, dim=1)
+            rates = self._compute_raw_rates_mrt(p_cand, channels_exp, noise_power)
+            loss = -torch.mean(rates)
+            loss.backward()
+            optimizer.step()
+            
+        # Select best restart
+        with torch.no_grad():
+            final_p = torch.softmax(opt_logits, dim=1)
+            all_rates = self._compute_raw_rates_mrt(final_p, channels_exp, noise_power)
+            rates_matrix = all_rates.view(B, num_restarts)
+            best_rates, best_indices = torch.max(rates_matrix, dim=1)
+            
+            if return_powers:
+                powers_matrix = final_p.view(B, num_restarts, N)
+                batch_indices = torch.arange(B, device=self.device)
+                return powers_matrix[batch_indices, best_indices, :]
+            else:
+                return best_rates
+
+# -----------------------------------------------------------------------------
+# FUNCTION: Training Loop
+# -----------------------------------------------------------------------------
+
+def train_downstream(model, train_loader, val_loader, warmup_loader, task_config):
+    """Trains the Power Allocation model with a Warm-up phase."""
+    device = task_config.device
+    model.to(device)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params, lr=task_config.lr)
+
+    # --- Phase 1: Warm-up (Supervised) ---
+    # Teaches the model to mimic PGD outputs before switching to Unsupervised Sum-Rate loss
+    mse_criterion = nn.MSELoss()
+    warmup_epochs = int(task_config.epochs * 0.2)
+    total_train_time = 0.0
+
+    for epoch in range(warmup_epochs):
+        t0 = time.time()
+        model.train()
+        for bx, target_p in warmup_loader:
+            optimizer.zero_grad()
+            pred_powers = model(bx)
+            loss = mse_criterion(pred_powers, target_p)
+            loss.backward()
+            optimizer.step()
+        
+        if device == 'cuda': torch.cuda.synchronize()
+        total_train_time += (time.time() - t0)
+
+    # --- Phase 2: Self-Supervised (Sum-Rate Max) ---
+    # Re-init optimizer
+    optimizer = optim.Adam(trainable_params, lr=task_config.lr)
+    
+    # Calculate Training Noise Floor for Loss Function
+    # We use a fixed target SNR (e.g., 5dB) to stabilize gradients during training
+    total_power = 0.0
+    total_samples = 0
+    with torch.no_grad():
+        for bx, _ in train_loader:
+            batch_power = torch.mean(torch.abs(bx)**2).item()
+            total_power += batch_power * bx.size(0)
+            total_samples += bx.size(0)
+    
+    train_signal_avg = total_power / total_samples
+    target_train_snr = 10 ** (5.0 / 10.0) 
+    train_noise_power = train_signal_avg / target_train_snr
+    
+    criterion = SumRateLoss(train_noise_power)
+    
+    # Schedulers & Tracking
+    self_supervised_epochs = task_config.epochs - warmup_epochs
+    scheduler = MultiStepLR(optimizer, milestones=[int(0.3*self_supervised_epochs), int(0.7*task_config.epochs)], gamma=0.1)
+    
+    history = {'train_loss': [], 'val_rate': []}
+    best_val_rate = -float('inf')
+    best_model_state = copy.deepcopy(model.state_dict())
+
+    for epoch in range(self_supervised_epochs):
+        # Train
+        t0 = time.time()
+        model.train()
+        epoch_loss = 0.0
+        
+        for (bx,) in train_loader:
+            bx = bx.to(device)
+            optimizer.zero_grad()
+            pred_powers = model(bx)
+            loss = criterion(pred_powers, bx)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        if device == 'cuda': torch.cuda.synchronize()
+        total_train_time += (time.time() - t0)
+        
+        scheduler.step()
+        history['train_loss'].append(epoch_loss / len(train_loader))
+
+        # Validate
+        model.eval()
+        val_rate_sum = 0.0
+        with torch.no_grad():
+            for (bx,) in val_loader:
+                bx = bx.to(device)
+                pred_powers = model(bx)
+                loss = criterion(pred_powers, bx)
+                val_rate_sum += (-loss.item()) # Negate loss to get rate
+
+        avg_val_rate = val_rate_sum / len(val_loader)
+        history['val_rate'].append(avg_val_rate)
+
+        if avg_val_rate > best_val_rate:
+            best_val_rate = avg_val_rate
+            best_model_state = copy.deepcopy(model.state_dict())
+
+    model.load_state_dict(best_model_state)
+    return avg_val_rate, model, history, total_train_time
+
+def perform_tsne(model, test_loader, device='cpu'):
+    """Extracts features and performs t-SNE visualization."""
+    model.eval()
+    model.to(device)
+    features, all_labels = [], []
+    max_samples = 2000
+    current_samples = 0
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            bx = batch[0].to(device)
+            feats = model.get_features(bx)
+            preds = model(bx)
+            labels_np = torch.argmax(preds, dim=1).cpu().numpy() # Pseudo-labels for coloring
+            
+            features.append(feats.flatten(start_dim=1))
+            all_labels.append(labels_np)
+            current_samples += bx.size(0)
+            if current_samples >= max_samples: break
+            
+    X_emb = np.concatenate(features, axis=0)[:max_samples]
+    labels = np.concatenate(all_labels, axis=0)[:max_samples]
+    
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42, init='pca', learning_rate='auto')
+    return tsne.fit_transform(X_emb), labels
+
+# -----------------------------------------------------------------------------
+# FUNCTION: Main Execution Task
+# -----------------------------------------------------------------------------
+
+def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig):
+    task_name = task_config.task_name
+    device = task_config.device
+    print(f"Starting Task: {task_name}")
+    
+    # --- 1. Setup Logs & Folders ---
+    time_now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    results_folder = os.path.join(task_config.results_dir, task_name, task_config.scenario_name, time_now)
+    os.makedirs(results_folder, exist_ok=True)
+    print(f"Results will be saved to: {results_folder}")
+
+    # Log files
+    eff_log = os.path.join(results_folder, "data_efficiency_results.csv")
+    snr_log = os.path.join(results_folder, "snr_results.csv")
+    res_log = os.path.join(results_folder, "resources_results.csv")
+
+    with open(eff_log, 'w', newline='') as f:
+        csv.writer(f).writerow(["Num_Users", "Train_Ratio", "Train_Samples", "Model_Name", "Sum_Rate", "Training_Time"])
+    with open(snr_log, 'w', newline='') as f:
+        csv.writer(f).writerow(["Num_Users", "Train_Ratio", "SNR_dB", "Model_Name", "Sum_Rate"])
+    with open(res_log, 'w', newline='') as f:
+        csv.writer(f).writerow(["Num_Users", "Model_Name", "MFLOPs", "Params_M", "Encoder_ms", "Head_ms"])
+
+    # --- 2. Data Generation ---
+    print(f"\nGenerating dataset for {task_config.scenario_name}")
+    generator = DeepMIMOGenerator(task_config.scenario_name)
+    benchmark = BenchmarkSuite(task_config.snr_range, device)
+    
+    total_samples = 3000
+    tsne_results = []
+
+    # --- 3. Complexity Loop (Number of Users) ---
+    for num_users in task_config.task_complexity:
+        print(f"\n--- Scenario: {num_users} Users ---")
+        
+        # A. Generate Data
+        X_all, gains, locs = generator.generate_dataset(num_samples=total_samples, num_users=num_users)
+        
+        # Save Map
+        pd.DataFrame({'x': locs[:, 0, 0], 'y': locs[:, 0, 1], 'z': locs[:, 0, 2], 'gain': gains[:, 0]})\
+          .to_csv(os.path.join(results_folder, f"user_map_data_{num_users}_users.csv"), index=False)
+
+        # B. Split Data
+        train_dl, val_dl, test_dl = create_dataloaders(X_all)
+
+        # C. Calibration: Calculate System Reference Power (from Train)
+        all_train_x = train_dl.dataset.tensors[0]
+        ref_power = torch.mean(torch.abs(all_train_x)**2).item()
+        print(f"System Ref Power: {ref_power:.6e}")
+
+        # D. Pre-compute Baselines (Optimal, ZF, Equal)
+        print(f"\tPre-computing Baselines...")
+        baseline_results = benchmark.compute_baselines(test_dl, ref_power=ref_power)
+
+        with open(snr_log, 'a', newline='') as f:
+            for i, snr in enumerate(baseline_results["SNR"]):
+                csv.writer(f).writerow([num_users, "N/A", snr, "Optimal", baseline_results["Optimal"][i]])
+                csv.writer(f).writerow([num_users, "N/A", snr, "Zero-Forcing", baseline_results["ZF"][i]])
+                csv.writer(f).writerow([num_users, "N/A", snr, "Equal-Power", baseline_results["Equal"][i]])
+
+        # E. Generate Warm-up Labels (Teacher Mode)
+        print(f"\tGenerating Warm-up Labels (PGD)...")
+        warmup_dl_subset = get_subset(train_dl, ratio=0.2)
+        X_warmup_list = [batch[0] for batch in warmup_dl_subset]
+        X_warmup = torch.cat(X_warmup_list)
+        
+        # Use PGD to generate "Ground Truth" powers for supervised pre-training
+        Y_warmup = benchmark.run_optimization_solver(
+            X_warmup.to(device), steps=50, num_restarts=10, return_powers=True
+        ).cpu()
+        
+        warmup_ds = TensorDataset(X_warmup, Y_warmup)
+        warmup_dl = DataLoader(warmup_ds, batch_size=32, shuffle=True)
+
+        # --- 4. Model Loop ---
+        for config in experiment_configs:
+            name = config.name
+            original_input_size = config.input_size
+            
+            # Adjust config for Multi-User
+            config.input_size = original_input_size * num_users
+            config.output_size = num_users
+            print(f"Training model: {name}")
+
+            # --- 5. Data Efficiency Loop ---
+            for ratio in task_config.train_ratios:
+                frac_train_dl = get_subset(train_dl, ratio)
+                frac_warmup_dl = get_subset(warmup_dl, ratio) # Subset of the warmup data too
+                n_samples = len(frac_train_dl.dataset)
+
+                # Train
+                model = build_model_from_config(config)
+                sum_rate, model, _, t_train = train_downstream(model, frac_train_dl, val_dl, frac_warmup_dl, task_config)
+
+                # Log
+                with open(eff_log, 'a', newline='') as f:
+                    csv.writer(f).writerow([num_users, ratio, n_samples, name, f"{sum_rate:.4f}", f"{t_train:.2f}s"])
+                
+                print(f"\tRatio {ratio:.4f} | Sum Rate: {sum_rate:.4f}")
+
+                # --- 6. Noise Robustness Loop ---
+                ai_snr_results = benchmark.run_model_benchmark(model, test_dl, ref_power=ref_power)
+                
+                for i, snr in enumerate(ai_snr_results["SNR"]):
+                    with open(snr_log, 'a', newline='') as f:
+                        csv.writer(f).writerow([num_users, ratio, snr, name, ai_snr_results["model"][i]])
+
+            # --- 7. Resources & Visualization ---
+            input_sample = X_all[0:1]
+            cost = get_flops_and_params(model, input_sample, device)
+            lat = get_latency(model, input_sample, device)
+
+            with open(res_log, 'a', newline='') as f:
+                csv.writer(f).writerow([num_users, name, cost["MFLOPs"], cost["Params_M"],
+                                        f"{lat['Encoder_ms']:.4f}", f"{lat['Head_ms']:.4f}"])
+
+            emb, labels = perform_tsne(model, test_dl, device)
+            tsne_results.append(pd.DataFrame({
+                'tsne_1': emb[:, 0], 'tsne_2': emb[:, 1],
+                'label': labels, 'model_name': name
+            }))
+            
+            # Reset config
+            config.input_size = original_input_size
+
+    # Save t-SNE
+    if tsne_results:
+        pd.concat(tsne_results, ignore_index=True).to_csv(os.path.join(results_folder, "tsne_comparison_data.csv"), index=False)
+        print(f"t-SNE data saved.")

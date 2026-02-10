@@ -6,6 +6,6 @@
     "output_size": 2,
     "latent_dim": null,
     "weights_path": null,
-    "task_type": "../residual_1d_cnn",
+    "task_type": "residual_1d_cnn",
     "fine_tune_layers": null
 }

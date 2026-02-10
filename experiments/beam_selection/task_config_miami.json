@@ -1,19 +1,20 @@
 {
-    "task_name": "Beam_Selection",
-    "scenario_name": "city_18_denver",
+    "task_name": "beam_selection",
+    "scenario_name": "city_6_miami",
     "train_ratios": [
-        0.08,
-        0.16,
-        0.24,
-        0.32,
-        0.4,
-        0.48,
-        0.56,
-        0.64,
-        0.72,
-        0.8
+        0.10,
+        0.20,
+        0.30,
+        0.40,
+        0.50,
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        1.00
     ],
     "snr_range": [
+        -25,
         -20,
         -15,
         -10,
@@ -22,7 +23,8 @@
         5,
         10,
         15,
-        20
+        20,
+        25
     ],
     "task_complexity": [
         16,
@@ -32,7 +34,7 @@
         256
     ],
     "batch_size": 32,
-    "epochs": 15,
+    "epochs": 50,
     "lr": 0.001,
     "device": "cuda",
     "results_dir": "../results"

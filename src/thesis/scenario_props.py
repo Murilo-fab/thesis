@@ -1,4 +1,40 @@
-def scenario_prop():
+"""
+DeepMIMO Scenario Properties Registry.
+
+This module serves as a central configuration database for the physical properties 
+of various DeepMIMO scenarios (Cities, O1, Boston5G, ASU Campus).
+
+It defines:
+1. Grid Dimensions: Number of rows and users per row.
+2. Antenna Counts: Number of BS antennas (e.g., 8, 16, 32, 64, 128).
+3. Bandwidth: Number of subcarriers (e.g., 32, 64, ..., 1024).
+
+This registry allows the `DeepMIMOGenerator` to dynamically configure itself 
+based on the scenario name string.
+
+Author: Murilo Ferreira Alves Batista - RWTH Aachen/USP
+"""
+
+from typing import Dict, Union, List, Any
+
+def scenario_prop() -> Dict[str, Dict[str, Union[int, List[int]]]]:
+    """
+    Returns the property dictionary for all supported DeepMIMO scenarios.
+
+    Schema:
+    {
+        'scenario_name': {
+            'n_rows': int | List[int],  # Total rows OR [start_row, end_row] for split datasets
+            'n_per_row': int,           # Number of users per row
+            'n_ant_bs': int,            # Number of Base Station Antennas
+            'n_subcarriers': int        # Number of OFDM Subcarriers
+        },
+        ...
+    }
+
+    Returns:
+        dict: A dictionary mapping scenario IDs to their physical configuration.
+    """
     row_column_users = {
     'city_0_newyork': {
         'n_rows': 109,
