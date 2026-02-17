@@ -236,11 +236,10 @@ def get_subset(original_loader: DataLoader, ratio: float, seed: int = 42) -> Dat
 # PART 3: PHYSICS & SIMULATION
 # =============================================================================
 
-def apply_fixed_noise(x_complex: torch.Tensor, noise_power: float) -> torch.Tensor:
+def apply_awgn(x_complex: torch.Tensor, noise_power: float) -> torch.Tensor:
     """
-    Applies Complex Gaussian Noise (AWGN) with a FIXED variance.
+    Applies Complex Gaussian Noise (AWGN) with a fixed variance.
     
-    Why Fixed? 
     Using fixed noise_power (derived from reference signal power) ensures correct 
     simulation of Path Loss. Far-away users (low signal) naturally get lower SNR 
     than close users (high signal) when noise floor is constant.
