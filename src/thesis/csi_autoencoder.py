@@ -264,18 +264,18 @@ def train_model(model, train_loader, val_loader, config, ref_power):
         ref_power (float): System reference power derived from training set.
                            Used to calculate fixed noise floor.
     """
-    device = config.DEVICE
+    device = config.device
     model.to(device)
     
     # 1. Setup Logging
     time_now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    task_id = f"{config.TASK_NAME}_{config.LATENT_DIM}"
-    results_folder = os.path.join(config.RESULTS_BASE, task_id, time_now)
+    task_id = f"{config.task_name}_{config.latent_dim}"
+    results_folder = os.path.join(config.results_dir, task_id, time_now)
     os.makedirs(results_folder, exist_ok=True)
-    os.makedirs(config.MODELS_DIR, exist_ok=True)
+    os.makedirs(config.models_dir, exist_ok=True)
     
     log_file = os.path.join(results_folder, "training_log.csv")
-    model_save_path = os.path.join(config.MODELS_DIR, f"csi_autoencoder_{config.LATENT_DIM}.pth")
+    model_save_path = os.path.join(config.models_dir, f"csi_autoencoder_{config.latent_dim}.pth")
     
     print(f"\nStarting Training: {task_id}")
     print(f"Ref Power: {ref_power:.6e}")
@@ -286,7 +286,7 @@ def train_model(model, train_loader, val_loader, config, ref_power):
         writer.writerow(["Epoch", "Train NMSE", "Val NMSE", "Learning Rate", "Time"])
 
     # 2. Optimizer
-    opt = optim.Adam(model.parameters(), lr=config.LR)
+    opt = optim.Adam(model.parameters(), lr=config.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=20, cooldown=5, min_lr=1e-6
     )
@@ -297,7 +297,7 @@ def train_model(model, train_loader, val_loader, config, ref_power):
     
     start_time = time.time()
     
-    for epoch in range(config.EPOCHS):
+    for epoch in range(config.epochs):
         # --- TRAIN STEP ---
         model.train()
         train_loss_sum = 0
@@ -413,21 +413,21 @@ if __name__ == "__main__":
     config = AutoEncoderConfig()
     
     # 1. Load Data
-    train_gen = MultiCityGenerator(config.TRAIN_CITIES, config.SCALE_FACTOR)
-    val_gen = MultiCityGenerator(config.VAL_CITY, config.SCALE_FACTOR)
+    train_gen = MultiCityGenerator(config.train_cities, config.scale_factor)
+    val_gen = MultiCityGenerator(config.val_cities, config.scale_factor)
     
     X_train, _ = train_gen.load_all()
     X_val, _ = val_gen.load_all()
     
-    train_dl = DataLoader(TensorDataset(X_train), batch_size=config.BATCH_SIZE, shuffle=True)
-    val_dl = DataLoader(TensorDataset(X_val), batch_size=config.BATCH_SIZE, shuffle=False)
+    train_dl = DataLoader(TensorDataset(X_train), batch_size=config.batch_size, shuffle=True)
+    val_dl = DataLoader(TensorDataset(X_val), batch_size=config.batch_size, shuffle=False)
     
     # 2. Physics Calibration (Global Reference Power)
     # Calculate average power of the training set to set the Noise Floor baseline
     ref_power = torch.mean(torch.abs(X_train)**2).item()
     
     # 3. Model
-    model = CSIAutoEncoder(latent_dim=config.LATENT_DIM, mode="train")
+    model = CSIAutoEncoder(latent_dim=config.latent_dim, mode="train")
     
     # 4. Train
     best_model, history, res_folder = train_model(model, train_dl, val_dl, config, ref_power)
