@@ -6,7 +6,7 @@
     "output_size": 2,
     "latent_dim": 128,
     "weights_path": "../models/model.pth",
-    "task_type": "classification",
+    "task_type": "simple_classification",
     "fine_tune_layers": [
         "layers.9",
         "layers.10",

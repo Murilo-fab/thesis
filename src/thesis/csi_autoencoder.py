@@ -128,7 +128,6 @@ class CSIAutoEncoder(nn.Module):
             self.load_state_dict(state_dict)
             self.to(device)
             self.eval()
-            print(f"Weights loaded from {path}")
         except RuntimeError as e:
             print(f"Error loading weights: {e}. Check latent_dim config.")
             raise e

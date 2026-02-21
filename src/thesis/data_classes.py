@@ -70,7 +70,7 @@ class TaskConfig(BaseConfig):
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Logging
-    results_dir: str = "./results"
+    results_dir: str = "../results"
 
     def __post_init__(self):
         self.results_dir = self.results_dir.rstrip("/")
@@ -146,8 +146,8 @@ class AutoEncoderConfig(BaseConfig):
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 4. Paths
-    models_dir: str = "./models"
-    results_dir: str = "./results"
+    models_dir: str = "../models"
+    results_dir: str = "../results"
 
     def __post_init__(self):
         """Standardize paths and hardware."""

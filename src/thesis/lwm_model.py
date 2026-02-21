@@ -364,314 +364,309 @@ Key Components:
 Author: Murilo Ferreira Alves Batista - RWTH Aachen/USP
 """
 
-import os
-import csv
-import math
-import time
-import torch
-import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from datetime import datetime
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+# import os
+# import csv
+# import math
+# import torch
+# import torch.nn as nn
+# import numpy as np
+# from tqdm import tqdm
+# from datetime import datetime
+# from collections import defaultdict
+# from dataclasses import dataclass, field
+# from typing import Dict, List
 
-from torch.utils.data import TensorDataset, DataLoader, random_split
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+# from torch.utils.data import TensorDataset, DataLoader
+# from torch.optim import AdamW
+# from torch.optim.lr_scheduler import LambdaLR
 
-# Local Imports
-import DeepMIMOv3
-from thesis.lwm_model import lwm, Tokenizer
-from thesis.utils import get_parameters, count_parameters
+# # Local Imports
+# import DeepMIMOv3
+# from thesis.utils import get_parameters
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------------
+# # -----------------------------------------------------------------------------
+# # CONFIGURATION
+# # -----------------------------------------------------------------------------
 
-@dataclass
-class PretrainConfig:
-    """Hyperparameters for LWM Pre-training."""
-    # Identity
-    TASK_NAME: str = "lwm_pretrain_masked"
+# @dataclass
+# class PretrainConfig:
+#     """Hyperparameters for LWM Pre-training."""
+#     # Identity
+#     TASK_NAME: str = "lwm_pretrain_masked"
     
-    # Data Generation
-    TRAIN_SCENARIOS: List[str] = field(default_factory=lambda: [
-        "city_7_sandiego", "city_11_santaclara", "city_12_fortworth", 
-        "city_15_indianapolis", "city_19_oklahoma"
-    ])
-    VAL_SCENARIO: str = "city_18_denver"
+#     # Data Generation
+#     TRAIN_SCENARIOS: List[str] = field(default_factory=lambda: [
+#         "city_7_sandiego", "city_11_santaclara", "city_12_fortworth", 
+#         "city_15_indianapolis", "city_19_oklahoma"
+#     ])
+#     VAL_SCENARIO: str = "city_18_denver"
     
-    # Tokenizer settings
-    PATCH_ROWS: int = 4
-    PATCH_COLS: int = 4
-    SCALE_FACTOR: float = 1e6
-    MASK_PERCENT: float = 0.40
+#     # Tokenizer settings
+#     PATCH_ROWS: int = 4
+#     PATCH_COLS: int = 4
+#     SCALE_FACTOR: float = 1e6
+#     MASK_PERCENT: float = 0.40
     
-    # Model Architecture
-    ELEMENT_LENGTH: int = 32 # (4*4*2)
-    D_MODEL: int = 128
-    N_LAYERS: int = 12
-    N_HEADS: int = 8
-    MAX_LEN: int = 513
-    DROPOUT: float = 0.1
+#     # Model Architecture
+#     ELEMENT_LENGTH: int = 32 # (4*4*2)
+#     D_MODEL: int = 128
+#     N_LAYERS: int = 12
+#     N_HEADS: int = 8
+#     MAX_LEN: int = 513
+#     DROPOUT: float = 0.1
     
-    # Training
-    EPOCHS: int = 50
-    BATCH_SIZE: int = 128
-    VAL_BATCH_SIZE: int = 64
-    BASE_LR: float = 5e-4
-    MIN_LR: float = 1e-8
-    WARMUP_EPOCHS: int = 5
-    WEIGHT_DECAY: float = 0.05
+#     # Training
+#     EPOCHS: int = 50
+#     BATCH_SIZE: int = 128
+#     VAL_BATCH_SIZE: int = 64
+#     BASE_LR: float = 5e-4
+#     MIN_LR: float = 1e-8
+#     WARMUP_EPOCHS: int = 5
+#     WEIGHT_DECAY: float = 0.05
     
-    # Hardware
-    DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    SEED: int = 42
+#     # Hardware
+#     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+#     SEED: int = 42
     
-    # Paths
-    SAVE_DIR: str = "./models/pretrain"
+#     # Paths
+#     SAVE_DIR: str = "./models/pretrain"
 
-# -----------------------------------------------------------------------------
-# DATA GENERATION (BUCKETING)
-# -----------------------------------------------------------------------------
+# # -----------------------------------------------------------------------------
+# # DATA GENERATION (BUCKETING)
+# # -----------------------------------------------------------------------------
 
-class PretrainDataGenerator:
-    """
-    Generates masked data from DeepMIMO and organizes it into buckets based on sequence length.
-    """
-    def __init__(self, config: PretrainConfig):
-        self.cfg = config
-        self.tokenizer = Tokenizer(
-            patch_rows=config.PATCH_ROWS,
-            patch_cols=config.PATCH_COLS,
-            scale_factor=config.SCALE_FACTOR,
-            max_len=config.MAX_LEN
-        )
+# class PretrainDataGenerator:
+#     """
+#     Generates masked data from DeepMIMO and organizes it into buckets based on sequence length.
+#     """
+#     def __init__(self, config: PretrainConfig):
+#         self.cfg = config
+#         self.tokenizer = Tokenizer(
+#             patch_rows=config.PATCH_ROWS,
+#             patch_cols=config.PATCH_COLS,
+#             scale_factor=config.SCALE_FACTOR,
+#             max_len=config.MAX_LEN
+#         )
 
-    def process_scenarios(self, scenarios: List[str]) -> Dict[int, TensorDataset]:
-        """
-        Loads scenarios, applies masking, and groups by sequence length.
-        Returns: Dict {seq_len: TensorDataset}
-        """
-        grouped_data = defaultdict(list)
-        total_samples = 0
+#     def process_scenarios(self, scenarios: List[str]) -> Dict[int, TensorDataset]:
+#         """
+#         Loads scenarios, applies masking, and groups by sequence length.
+#         Returns: Dict {seq_len: TensorDataset}
+#         """
+#         grouped_data = defaultdict(list)
+#         total_samples = 0
         
-        print(f"Generating data for {len(scenarios)} scenarios...")
+#         print(f"Generating data for {len(scenarios)} scenarios...")
         
-        for scenario in scenarios:
-            try:
-                # 1. Load Raw Data
-                params = get_parameters(scenario)
-                deepmimo_data = DeepMIMOv3.generate_data(params)
+#         for scenario in scenarios:
+#             try:
+#                 # 1. Load Raw Data
+#                 params = get_parameters(scenario)
+#                 deepmimo_data = DeepMIMOv3.generate_data(params)
                 
-                # Filter valid users
-                los = deepmimo_data[0]['user']['LoS']
-                valid = np.where(los != -1)[0]
-                raw_chs = deepmimo_data[0]['user']['channel'][valid] # (N, 1, Tx, SC)
+#                 # Filter valid users
+#                 los = deepmimo_data[0]['user']['LoS']
+#                 valid = np.where(los != -1)[0]
+#                 raw_chs = deepmimo_data[0]['user']['channel'][valid] # (N, 1, Tx, SC)
                 
-                if raw_chs.ndim == 4:
-                    raw_chs = raw_chs.squeeze(axis=1) # (N, Tx, SC)
+#                 if raw_chs.ndim == 4:
+#                     raw_chs = raw_chs.squeeze(axis=1) # (N, Tx, SC)
                 
-                # 2. Tokenize & Mask
-                # Convert to Tensor
-                x_complex = torch.tensor(raw_chs, dtype=torch.complex64)
+#                 # 2. Tokenize & Mask
+#                 # Convert to Tensor
+#                 x_complex = torch.tensor(raw_chs, dtype=torch.complex64)
                 
-                # Apply Tokenizer with Masking enabled
-                # Returns: (tokens, targets, mask_indices)
-                tokens, targets, mask_pos = self.tokenizer(
-                    x_complex, 
-                    mask=True, 
-                    masking_percent=self.cfg.MASK_PERCENT
-                )
+#                 # Apply Tokenizer with Masking enabled
+#                 # Returns: (tokens, targets, mask_indices)
+#                 tokens, targets, mask_pos = self.tokenizer(
+#                     x_complex, 
+#                     mask=True, 
+#                     masking_percent=self.cfg.MASK_PERCENT
+#                 )
                 
-                # 3. Group by Sequence Length
-                # tokens shape: [Batch, Seq_Len, Feat]
-                seq_len = tokens.shape[1]
+#                 # 3. Group by Sequence Length
+#                 # tokens shape: [Batch, Seq_Len, Feat]
+#                 seq_len = tokens.shape[1]
                 
-                # Store tuple (tokens, targets, mask_pos)
-                grouped_data[seq_len].append((tokens, targets, mask_pos))
-                total_samples += tokens.shape[0]
+#                 # Store tuple (tokens, targets, mask_pos)
+#                 grouped_data[seq_len].append((tokens, targets, mask_pos))
+#                 total_samples += tokens.shape[0]
                 
-            except Exception as e:
-                print(f"Skipping {scenario}: {e}")
+#             except Exception as e:
+#                 print(f"Skipping {scenario}: {e}")
 
-        # 4. Consolidate into TensorDatasets
-        bucketed_datasets = {}
-        print(f"Consolidating buckets...")
+#         # 4. Consolidate into TensorDatasets
+#         bucketed_datasets = {}
+#         print(f"Consolidating buckets...")
         
-        for length, data_list in grouped_data.items():
-            # data_list is a list of tuples [(tok, tar, pos), (tok, tar, pos)...]
-            # Unzip them
-            all_tokens = torch.cat([x[0] for x in data_list], dim=0)
-            all_targets = torch.cat([x[1] for x in data_list], dim=0)
-            all_pos = torch.cat([x[2] for x in data_list], dim=0)
+#         for length, data_list in grouped_data.items():
+#             # data_list is a list of tuples [(tok, tar, pos), (tok, tar, pos)...]
+#             # Unzip them
+#             all_tokens = torch.cat([x[0] for x in data_list], dim=0)
+#             all_targets = torch.cat([x[1] for x in data_list], dim=0)
+#             all_pos = torch.cat([x[2] for x in data_list], dim=0)
             
-            bucketed_datasets[length] = TensorDataset(all_tokens, all_targets, all_pos)
+#             bucketed_datasets[length] = TensorDataset(all_tokens, all_targets, all_pos)
             
-        print(f"Total Samples: {total_samples} | Buckets: {list(bucketed_datasets.keys())}")
-        return bucketed_datasets
+#         print(f"Total Samples: {total_samples} | Buckets: {list(bucketed_datasets.keys())}")
+#         return bucketed_datasets
 
-# -----------------------------------------------------------------------------
-# LOSS & TRAINING
-# -----------------------------------------------------------------------------
+# # -----------------------------------------------------------------------------
+# # LOSS & TRAINING
+# # -----------------------------------------------------------------------------
 
-def nmse_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-    """
-    Calculates NMSE between predicted masked tokens and ground truth.
-    y_pred: [Batch, N_Masked, Feat]
-    y_true: [Batch, N_Masked, Feat]
-    """
-    # Flatten features
-    y_pred_flat = y_pred.reshape(y_pred.size(0), -1)
-    y_true_flat = y_true.reshape(y_true.size(0), -1)
+# def nmse_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+#     """
+#     Calculates NMSE between predicted masked tokens and ground truth.
+#     y_pred: [Batch, N_Masked, Feat]
+#     y_true: [Batch, N_Masked, Feat]
+#     """
+#     # Flatten features
+#     y_pred_flat = y_pred.reshape(y_pred.size(0), -1)
+#     y_true_flat = y_true.reshape(y_true.size(0), -1)
 
-    mse = torch.sum((y_true_flat - y_pred_flat)**2, dim=-1)
-    power = torch.sum(y_true_flat**2, dim=-1)
+#     mse = torch.sum((y_true_flat - y_pred_flat)**2, dim=-1)
+#     power = torch.sum(y_true_flat**2, dim=-1)
     
-    return mse / (power + 1e-8)
+#     return mse / (power + 1e-8)
 
-def train_lwm_epoch(model, loaders, optimizer, scheduler, device):
-    """Runs one training epoch over all buckets."""
-    model.train()
-    total_nmse = 0.0
-    total_samples = 0
+# def train_lwm_epoch(model, loaders, optimizer, scheduler, device):
+#     """Runs one training epoch over all buckets."""
+#     model.train()
+#     total_nmse = 0.0
+#     total_samples = 0
     
-    # Iterate over buckets (Sequence Lengths)
-    for length, loader in loaders.items():
-        with tqdm(loader, desc=f"Train Len {length}", unit="batch", leave=False) as t:
-            for batch in t:
-                # Unpack: Input Tokens (with [MASK]), Target Patches, Mask Indices
-                input_ids, targets, mask_pos = [b.to(device) for b in batch]
+#     # Iterate over buckets (Sequence Lengths)
+#     for length, loader in loaders.items():
+#         with tqdm(loader, desc=f"Train Len {length}", unit="batch", leave=False) as t:
+#             for batch in t:
+#                 # Unpack: Input Tokens (with [MASK]), Target Patches, Mask Indices
+#                 input_ids, targets, mask_pos = [b.to(device) for b in batch]
                 
-                optimizer.zero_grad()
+#                 optimizer.zero_grad()
                 
-                # Forward Pass
-                # LWM forward needs mask_pos to select which tokens to predict
-                logits_lm, _, _ = model(input_ids, mask_pos)
+#                 # Forward Pass
+#                 # LWM forward needs mask_pos to select which tokens to predict
+#                 logits_lm, _, _ = model(input_ids, mask_pos)
                 
-                # Loss Calculation
-                loss_batch = torch.sum(nmse_loss(logits_lm, targets))
-                loss_mean = loss_batch / input_ids.size(0) # For optimization scaling
+#                 # Loss Calculation
+#                 loss_batch = torch.sum(nmse_loss(logits_lm, targets))
+#                 loss_mean = loss_batch / input_ids.size(0) # For optimization scaling
                 
-                loss_mean.backward()
-                optimizer.step()
-                scheduler.step()
+#                 loss_mean.backward()
+#                 optimizer.step()
+#                 scheduler.step()
                 
-                # Metrics
-                batch_size = input_ids.size(0)
-                total_nmse += loss_batch.item()
-                total_samples += batch_size
+#                 # Metrics
+#                 batch_size = input_ids.size(0)
+#                 total_nmse += loss_batch.item()
+#                 total_samples += batch_size
                 
-                t.set_postfix({"NMSE": total_nmse/total_samples, "LR": f"{scheduler.get_last_lr()[0]:.2e}"})
+#                 t.set_postfix({"NMSE": total_nmse/total_samples, "LR": f"{scheduler.get_last_lr()[0]:.2e}"})
                 
-    return total_nmse / max(total_samples, 1)
+#     return total_nmse / max(total_samples, 1)
 
-def validate_lwm(model, loaders, device):
-    """Runs validation."""
-    model.eval()
-    total_nmse = 0.0
-    total_samples = 0
+# def validate_lwm(model, loaders, device):
+#     """Runs validation."""
+#     model.eval()
+#     total_nmse = 0.0
+#     total_samples = 0
     
-    with torch.no_grad():
-        for length, loader in loaders.items():
-            for batch in loader:
-                input_ids, targets, mask_pos = [b.to(device) for b in batch]
+#     with torch.no_grad():
+#         for length, loader in loaders.items():
+#             for batch in loader:
+#                 input_ids, targets, mask_pos = [b.to(device) for b in batch]
                 
-                logits_lm, _, _ = model(input_ids, mask_pos)
+#                 logits_lm, _, _ = model(input_ids, mask_pos)
                 
-                loss_sum = torch.sum(nmse_loss(logits_lm, targets))
-                total_nmse += loss_sum.item()
-                total_samples += input_ids.size(0)
+#                 loss_sum = torch.sum(nmse_loss(logits_lm, targets))
+#                 total_nmse += loss_sum.item()
+#                 total_samples += input_ids.size(0)
                 
-    return total_nmse / max(total_samples, 1)
+#     return total_nmse / max(total_samples, 1)
 
-# -----------------------------------------------------------------------------
-# MAIN EXECUTION
-# -----------------------------------------------------------------------------
+# # -----------------------------------------------------------------------------
+# # MAIN EXECUTION
+# # -----------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    cfg = PretrainConfig()
+# if __name__ == "__main__":
+#     cfg = PretrainConfig()
     
-    # 1. Setup
-    torch.manual_seed(cfg.SEED)
-    np.random.seed(cfg.SEED)
+#     # 1. Setup
+#     torch.manual_seed(cfg.SEED)
+#     np.random.seed(cfg.SEED)
     
-    start_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    run_dir = os.path.join(cfg.SAVE_DIR, start_time)
-    os.makedirs(run_dir, exist_ok=True)
+#     start_time = datetime.now().strftime("%Y-%m-%d_%H-%M")
+#     run_dir = os.path.join(cfg.SAVE_DIR, start_time)
+#     os.makedirs(run_dir, exist_ok=True)
     
-    log_path = os.path.join(run_dir, "training_log.csv")
-    with open(log_path, 'w', newline='') as f:
-        csv.writer(f).writerow(["Epoch", "Train_NMSE", "Val_NMSE", "LR"])
+#     log_path = os.path.join(run_dir, "training_log.csv")
+#     with open(log_path, 'w', newline='') as f:
+#         csv.writer(f).writerow(["Epoch", "Train_NMSE", "Val_NMSE", "LR"])
 
-    # 2. Data Preparation
-    generator = PretrainDataGenerator(cfg)
+#     # 2. Data Preparation
+#     generator = PretrainDataGenerator(cfg)
     
-    # Load separate buckets
-    train_buckets = generator.process_scenarios(cfg.TRAIN_SCENARIOS)
-    val_buckets = generator.process_scenarios([cfg.VAL_SCENARIO])
+#     # Load separate buckets
+#     train_buckets = generator.process_scenarios(cfg.TRAIN_SCENARIOS)
+#     val_buckets = generator.process_scenarios([cfg.VAL_SCENARIO])
     
-    # Create DataLoaders
-    train_loaders = {k: DataLoader(v, batch_size=cfg.BATCH_SIZE, shuffle=True) for k, v in train_buckets.items()}
-    val_loaders = {k: DataLoader(v, batch_size=cfg.VAL_BATCH_SIZE, shuffle=False) for k, v in val_buckets.items()}
+#     # Create DataLoaders
+#     train_loaders = {k: DataLoader(v, batch_size=cfg.BATCH_SIZE, shuffle=True) for k, v in train_buckets.items()}
+#     val_loaders = {k: DataLoader(v, batch_size=cfg.VAL_BATCH_SIZE, shuffle=False) for k, v in val_buckets.items()}
 
-    # 3. Model
-    model = lwm(
-        element_length=cfg.ELEMENT_LENGTH,
-        d_model=cfg.D_MODEL,
-        n_layers=cfg.N_LAYERS,
-        n_heads=cfg.N_HEADS,
-        max_len=cfg.MAX_LEN,
-        dropout=cfg.DROPOUT
-    ).to(cfg.DEVICE)
+#     # 3. Model
+#     model = lwm(
+#         element_length=cfg.ELEMENT_LENGTH,
+#         d_model=cfg.D_MODEL,
+#         n_layers=cfg.N_LAYERS,
+#         n_heads=cfg.N_HEADS,
+#         max_len=cfg.MAX_LEN,
+#         dropout=cfg.DROPOUT
+#     ).to(cfg.DEVICE)
     
-    print(f"Model Parameters: {count_parameters(model):,}")
+#     # 4. Optimizer & Scheduler
+#     # Calculate total steps for correct cosine decay
+#     total_steps_epoch = sum(len(l) for l in train_loaders.values())
+#     total_steps = total_steps_epoch * cfg.EPOCHS
+#     warmup_steps = total_steps_epoch * cfg.WARMUP_EPOCHS
+    
+#     optimizer = AdamW(model.parameters(), lr=cfg.BASE_LR, weight_decay=cfg.WEIGHT_DECAY, betas=(0.9, 0.999))
+    
+#     def lr_lambda(step):
+#         if step < warmup_steps:
+#             return float(step) / float(max(1, warmup_steps))
+#         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+#         return 0.5 * (1.0 + math.cos(math.pi * progress)) * (1 - cfg.MIN_LR/cfg.BASE_LR) + cfg.MIN_LR/cfg.BASE_LR
 
-    # 4. Optimizer & Scheduler
-    # Calculate total steps for correct cosine decay
-    total_steps_epoch = sum(len(l) for l in train_loaders.values())
-    total_steps = total_steps_epoch * cfg.EPOCHS
-    warmup_steps = total_steps_epoch * cfg.WARMUP_EPOCHS
-    
-    optimizer = AdamW(model.parameters(), lr=cfg.BASE_LR, weight_decay=cfg.WEIGHT_DECAY, betas=(0.9, 0.999))
-    
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress)) * (1 - cfg.MIN_LR/cfg.BASE_LR) + cfg.MIN_LR/cfg.BASE_LR
+#     scheduler = LambdaLR(optimizer, lr_lambda)
 
-    scheduler = LambdaLR(optimizer, lr_lambda)
-
-    # 5. Training Loop
-    best_nmse = float('inf')
+#     # 5. Training Loop
+#     best_nmse = float('inf')
     
-    print(f"\nStarting Pre-training for {cfg.EPOCHS} epochs...")
+#     print(f"\nStarting Pre-training for {cfg.EPOCHS} epochs...")
     
-    for epoch in range(cfg.EPOCHS):
-        print(f"\n--- Epoch {epoch+1}/{cfg.EPOCHS} ---")
+#     for epoch in range(cfg.EPOCHS):
+#         print(f"\n--- Epoch {epoch+1}/{cfg.EPOCHS} ---")
         
-        # Train
-        train_nmse = train_lwm_epoch(model, train_loaders, optimizer, scheduler, cfg.DEVICE)
+#         # Train
+#         train_nmse = train_lwm_epoch(model, train_loaders, optimizer, scheduler, cfg.DEVICE)
         
-        # Validate
-        val_nmse = validate_lwm(model, val_loaders, cfg.DEVICE)
+#         # Validate
+#         val_nmse = validate_lwm(model, val_loaders, cfg.DEVICE)
         
-        # Log
-        lr_curr = scheduler.get_last_lr()[0]
-        print(f"Train NMSE: {train_nmse:.6f} | Val NMSE: {val_nmse:.6f} | LR: {lr_curr:.2e}")
+#         # Log
+#         lr_curr = scheduler.get_last_lr()[0]
+#         print(f"Train NMSE: {train_nmse:.6f} | Val NMSE: {val_nmse:.6f} | LR: {lr_curr:.2e}")
         
-        with open(log_path, 'a', newline='') as f:
-            csv.writer(f).writerow([epoch+1, train_nmse, val_nmse, lr_curr])
+#         with open(log_path, 'a', newline='') as f:
+#             csv.writer(f).writerow([epoch+1, train_nmse, val_nmse, lr_curr])
             
-        # Save Best
-        if val_nmse < best_nmse:
-            best_nmse = val_nmse
-            save_path = os.path.join(run_dir, f"lwm_best_mask{cfg.MASK_PERCENT}_nmse{val_nmse:.4f}.pth")
-            torch.save(model.state_dict(), save_path)
-            print(f" >> Model Saved: {save_path}")
+#         # Save Best
+#         if val_nmse < best_nmse:
+#             best_nmse = val_nmse
+#             save_path = os.path.join(run_dir, f"lwm_best_mask{cfg.MASK_PERCENT}_nmse{val_nmse:.4f}.pth")
+#             torch.save(model.state_dict(), save_path)
+#             print(f" >> Model Saved: {save_path}")
 
-    print("\nPre-training Complete.")
+#     print("\nPre-training Complete.")

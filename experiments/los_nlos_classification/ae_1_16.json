@@ -6,6 +6,6 @@
     "output_size": 2,
     "latent_dim": 128,
     "weights_path": "../models/csi_autoencoder_128.pth",
-    "task_type": "classification",
+    "task_type": "simple_classification",
     "fine_tune_layers": null
 }

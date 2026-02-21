@@ -3,9 +3,8 @@ Downstream Model Architectures.
 
 This module defines:
 1. Task Heads: Classification (Linear), Regression (Softmax), and Enhanced Heads.
-2. Baselines: 1D-CNN (ResNet-style) for comparison.
-3. Wrapper: A unified interface to connect Tokenizers/Encoders (LWM/AE) with Task Heads.
-4. Factory: A builder function to instantiate models from config files.
+2. Wrapper: A unified interface to connect Tokenizers/Encoders (LWM/AE) with Task Heads.
+3. Factory: A builder function to instantiate models from config files.
 
 Author: Murilo Ferreira Alves Batista - RWTH Aachen/USP
 """
@@ -21,6 +20,44 @@ from thesis.lwm_model import lwm, Tokenizer
 # =============================================================================
 # PART 1: TASK HEADS
 # =============================================================================
+
+class SimpleClassificationHead(nn.Module):
+    """
+    Simple linear probe
+    """
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        x = x.flatten(start_dim=1)
+        return self.classifier(x)
+    
+class EnhancedClassificationHead(nn.Module):
+    """
+    Classification Head with Logarithmic Preprocessing.
+    
+    Physics Note:
+    Wireless channel features often span orders of magnitude. 
+    Applying log10(abs(x)) converts values to dB-scale, which is easier for MLPs to learn.
+    """
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1)
+        # Log-scale transformation (dB-like)
+        x = torch.log10(torch.abs(x) + 1e-9)
+        return self.classifier(x)
 
 class ClassificationHead(nn.Module):
     """
@@ -53,41 +90,6 @@ class ClassificationHead(nn.Module):
         x = x.flatten(start_dim=1)
         return self.classifier(x)
 
-class EnhancedClassificationHead(nn.Module):
-    """
-    Classification Head with Logarithmic Preprocessing.
-    
-    Physics Note:
-    Wireless channel features often span orders of magnitude. 
-    Applying log10(abs(x)) converts values to dB-scale, which is easier for MLPs to learn.
-    """
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        x = x.flatten(start_dim=1)
-        # Log-scale transformation (dB-like)
-        x = torch.log10(torch.abs(x) + 1e-9)
-        return self.classifier(x)
-
 class RegressionHead(nn.Module):
     """
     Regression Head for Power Allocation.
@@ -107,86 +109,7 @@ class RegressionHead(nn.Module):
         return self.regressor(x)
 
 # =============================================================================
-# PART 2: BASELINE MODELS (1D CNN)
-# =============================================================================
-
-class ResidualBlock(nn.Module):
-    """ Standard 1D Residual Block for Res1DCNN. """
-    def __init__(self, in_channels, out_channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        
-        self.shortcut = nn.Sequential()
-        if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1),
-                nn.BatchNorm1d(out_channels)
-            )
-
-    def forward(self, x):
-        residual = x
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        x += self.shortcut(residual)
-        x = F.relu(x)
-        return x
-
-class Res1DCNN(nn.Module):
-    """
-    Universal Downstream Baseline: 1D ResNet-style CNN.
-    Used to benchmark if deep learning adds value over standard CNNs.
-    """
-    def __init__(self, input_channels, num_classes):
-        super(Res1DCNN, self).__init__()
-        self.in_ch = input_channels
-
-        self.features = nn.Sequential(
-            # Stem
-            nn.Conv1d(input_channels, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
-            
-            # Residual Layers (Depths: 2, 3, 4)
-            self._make_layer(32, 32, 2),
-            self._make_layer(32, 64, 3),
-            self._make_layer(64, 128, 4),
-            
-            # Global Pooling
-            nn.AdaptiveAvgPool1d(1)
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, num_classes)
-        )
-        
-        # Aliases for unified interface
-        self.encoder = self.features
-        self.task_head = self.classifier
-
-    def _make_layer(self, in_channels, out_channels, num_blocks):
-        layers = [ResidualBlock(in_channels, out_channels)]
-        for _ in range(1, num_blocks):
-            layers.append(ResidualBlock(out_channels, out_channels))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        # x: [Batch, Len, Channels] -> [Batch, Channels, Len]
-        x = x.transpose(1, 2)
-        x = self.features(x)
-        x = x.flatten(1)
-        x = self.classifier(x)
-        return x
-
-# =============================================================================
-# PART 3: UNIFIED WRAPPER
+# PART 2: UNIFIED WRAPPER
 # =============================================================================
 
 class Wrapper(nn.Module):
@@ -281,7 +204,7 @@ class Wrapper(nn.Module):
         return self.task_head(features)
 
 # =============================================================================
-# PART 4: FACTORY & UTILS
+# PART 3: FACTORY & UTILS
 # =============================================================================
 
 def build_model_from_config(config):
@@ -290,10 +213,10 @@ def build_model_from_config(config):
     """
     # 1. Build Task Head
     head_map = {
+        "simple_classification": SimpleClassificationHead,
         "classification": ClassificationHead,
         "enhanced_classification": EnhancedClassificationHead,
         "regression": RegressionHead,
-        "residual_1d_cnn": Res1DCNN
     }
     
     if config.task_type not in head_map:
@@ -315,7 +238,7 @@ def build_model_from_config(config):
     # Case B: LWM
     elif config.encoder_type == "LWM":
         # Standard Tokenizer setup for LWM
-        tokenizer = Tokenizer(patch_rows=4, patch_cols=4, scale_factor=1e0)
+        tokenizer = Tokenizer(patch_rows=4, patch_cols=4)
         encoder = lwm.from_pretrained(config.weights_path)
 
     # 3. Fine-tuning Control (Freeze/Unfreeze)

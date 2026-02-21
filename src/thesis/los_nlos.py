@@ -284,11 +284,25 @@ def run_los_nlos_task(experiment_configs: list, task_config: TaskConfig):
             model = build_model_from_config(config)
             final_f1, model, _, train_time = train_downstream(model, frac_train_dl, val_dl, task_config)
 
+            # Evaluation
+            model.eval()
+            all_preds, all_targets = [], []
+                
+            with torch.no_grad():
+                for bx, by in test_dl:
+                    bx, by = bx.to(device), by.to(device)
+                        
+                    logits = model(bx.to(device))
+                    all_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                    all_targets.extend(by.cpu().numpy())
+                
+            f1 = f1_score(all_targets, all_preds, average='weighted')
+
             # C. Log Efficiency
             with open(eff_log, 'a', newline='') as f:
-                csv.writer(f).writerow([ratio, n_samples, name, f"{final_f1:.4f}", f"{train_time:.2f}s"])
+                csv.writer(f).writerow([ratio, n_samples, name, f"{f1:.4f}", f"{train_time:.2f}s"])
             
-            print(f"\tRatio {ratio:.4f} ({n_samples} samples) | Final F1: {final_f1:.4f}")
+            print(f"\tRatio {ratio:.4f} ({n_samples} samples) | F1: {f1:.4f}")
 
             # --- 5. Noise Robustness Loop (SNR) ---
             # We evaluate the CURRENT model (trained on specific ratio) against varying noise.
