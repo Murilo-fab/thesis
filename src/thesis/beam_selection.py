@@ -342,11 +342,26 @@ def run_beam_selection_task(experiment_configs: list, task_config: TaskConfig):
                 model = build_model_from_config(config)
                 final_f1, model, _, total_train_time = train_downstream(model, frac_train_dl, val_dl, task_config)
 
+                all_preds = []
+                all_targets = []
+
+                model.eval()
+                with torch.no_grad():
+                    for bx, by in test_dl:
+                        bx, by = bx.to(device), by.to(device)
+                        
+                        logits = model(bx.to(device))
+                        
+                        all_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                        all_targets.extend(by.cpu().numpy())
+
+                f1 = f1_score(all_targets, all_preds, average='weighted')
+
                 # C. Log Efficiency
                 with open(eff_log, 'a', newline='') as f:
-                    csv.writer(f).writerow([n_beams, ratio, n_train_samples, name, f"{final_f1:.4f}", f"{total_train_time:.2f}s"])
+                    csv.writer(f).writerow([n_beams, ratio, n_train_samples, name, f"{f1:.4f}", f"{total_train_time:.2f}s"])
 
-                print(f"\tRatio {ratio:.4f} | F1: {final_f1:.4f}")
+                print(f"\tRatio {ratio:.4f} | F1: {f1:.4f}")
 
                 # --- 5. Noise Robustness Loop (SNR) ---
                 for snr in task_config.snr_range:

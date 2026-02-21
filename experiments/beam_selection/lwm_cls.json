@@ -6,6 +6,6 @@
     "output_size": 2,
     "latent_dim": 128,
     "weights_path": "../models/model.pth",
-    "task_type": "residual_1d_cnn",
+    "task_type": "classification",
     "fine_tune_layers": null
 }
