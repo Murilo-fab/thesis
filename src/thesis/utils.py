@@ -185,7 +185,6 @@ def create_dataloaders(
         test_ds = TensorDataset(x_test)
         
     # Create Loaders
-    # Note: drop_last=True for training prevents issues with BatchNorm on small final batches
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
@@ -220,14 +219,19 @@ def get_subset(original_loader: DataLoader, ratio: float, seed: int = 42) -> Dat
     
     # Create Subset
     subset_ds = Subset(dataset, subset_indices)
+
+    # Drop last verification
+    batch_size = original_loader.batch_size
+    drop_last = (len(subset_ds) % batch_size) == 1
     
     # Preserve original loader settings (workers, pinning)
     new_loader = DataLoader(
         subset_ds,
-        batch_size=original_loader.batch_size,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=original_loader.num_workers,
-        pin_memory=original_loader.pin_memory
+        pin_memory=original_loader.pin_memory,
+        drop_last=drop_last
     )
     
     return new_loader
