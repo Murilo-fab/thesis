@@ -250,54 +250,85 @@ class BenchmarkSuite:
         return ref_power / snr_linear
 
     def _compute_raw_rates_mrt(self, powers, channels, noise_power):
-        """Helper to compute Sum Rate for baselines (Shared MRT logic)."""
+        """
+        Helper to compute Sum Rate for baselines.
+        Rewritten to strictly mirror the physics in SumRateLoss.
+        """
         B, N, Tx, SC = channels.shape
         
-        if powers.dim() == 2: 
-            P_broad = powers.reshape(B, N, 1, 1) / SC
-        else:
-            P_broad = powers / SC
-
+        # Model outputs total power fraction [B, N]. 
+        # Divide by SC because the budget is shared across all subcarriers.
+        power_per_sc = powers / SC 
+            
         total_rate = torch.zeros(B, device=self.device)
 
         for k in range(SC):
-            H_k = channels[:, :, :, k]
+            H_k = channels[:, :, :, k] # Shape: [B, N, Tx]
             
-            # MRT Math
-            Gram = torch.matmul(H_k, H_k.conj().transpose(1, 2))
-            MagSq = Gram.abs().pow(2) 
-            Norms = torch.diagonal(Gram, dim1=1, dim2=2).real 
-            Norms_broad = Norms.unsqueeze(1)
-            G_eff = MagSq / (Norms_broad + 1e-12)
+            # 1. MRT Precoding: w = h* / |h|
+            norms = torch.norm(H_k, dim=2, keepdim=True) + 1e-12
+            w_precoder = torch.conj(H_k) / norms # Shape: [B, N, Tx]
             
-            P_vec = P_broad.reshape(B, 1, N) 
-            Rx_Matrix = G_eff * P_vec
+            # 2. Apply Power Amplitude
+            p_k = power_per_sc.unsqueeze(-1) # Shape: [B, N, 1]
+            amplitudes = torch.sqrt(p_k + 1e-12)
+            w_scaled = w_precoder * amplitudes # Shape: [B, N, Tx]
             
-            Signal = torch.diagonal(Rx_Matrix, dim1=1, dim2=2)
-            Total_Rx = torch.sum(Rx_Matrix, dim=2)
-            Interference = torch.clamp(Total_Rx - Signal, min=0.0)
+            # 3. Effective Channel: H * w_scaled^T
+            rx_signal_matrix = torch.matmul(H_k, w_scaled.transpose(1, 2)) # Shape: [B, N, N]
+            rx_power_matrix = torch.abs(rx_signal_matrix)**2
             
-            SINR = Signal / (Interference + noise_power + 1e-12)
-            total_rate += torch.sum(torch.log2(1 + SINR), dim=1)
+            # 4. SINR Calculation
+            signal_power = torch.diagonal(rx_power_matrix, dim1=1, dim2=2)
+            total_rx_power = torch.sum(rx_power_matrix, dim=2)
+            interference_power = torch.clamp(total_rx_power - signal_power, min=0.0)
+            
+            # Shannon Capacity
+            sinr = signal_power / (interference_power + noise_power + 1e-12)
+            total_rate += torch.sum(torch.log2(1 + sinr), dim=1)
             
         return total_rate
     
     def _compute_zf_rates(self, channels, noise_power):
-        """Calculates Sum Rate for Zero-Forcing (ZF) Beamforming."""
+        """
+        Calculates Sum Rate for Zero-Forcing (ZF) Beamforming.
+        Strictly enforces the total sum-power constraint per subcarrier.
+        """
         B, N, Tx, SC = channels.shape
         total_rate = torch.zeros(B, device=self.device)
-        tx_power_per_stream = 1.0 / (N * SC) # Equal power sharing
+        
+        # Power budget per subcarrier (Assuming total power budget = 1.0)
+        p_budget_per_sc = 1.0 / SC 
 
         for k in range(SC):
-            H_k = channels[:, :, :, k]
-            # H_dag = (H^H H)^-1 H^H -> Pseudo Inverse
-            W_k = torch.linalg.pinv(H_k) 
+            H_k = channels[:, :, :, k] # Shape: [B, N, Tx]
             
-            # Noise Enhancement Penalty (Power cost to invert channel)
-            penalty = torch.sum(W_k.abs()**2, dim=1) 
-            rx_sig = tx_power_per_stream / (penalty + 1e-12)
+            # 1. Compute Pseudo-Inverse: W_zf = H^H (H H^H)^-1
+            # torch.linalg.pinv handles this directly
+            W_k = torch.linalg.pinv(H_k) # Shape: [B, Tx, N]
             
-            sinr = rx_sig / (noise_power + 1e-12)
+            # 2. Enforce Total Power Constraint: Tr(W * W^H) = p_budget_per_sc
+            # Calculate the current total power of the unnormalized precoder
+            current_power = torch.sum(W_k.abs()**2, dim=(1, 2), keepdim=True) # Shape: [B, 1, 1]
+            
+            # Scale W to meet the exact budget
+            scaling_factor = torch.sqrt(p_budget_per_sc / (current_power + 1e-12))
+            W_norm = W_k * scaling_factor
+            
+            # 3. Effective Channel: H * W
+            # Because it's ZF, the resulting matrix should be nearly diagonal
+            rx_signal_matrix = torch.matmul(H_k, W_norm) # Shape: [B, N, N]
+            rx_power_matrix = torch.abs(rx_signal_matrix)**2
+            
+            # 4. SINR Calculation
+            signal_power = torch.diagonal(rx_power_matrix, dim1=1, dim2=2) # Shape: [B, N]
+            
+            # ZF theoretically zeroes interference, but we calculate it to catch any floating point/normalization artifacts
+            total_rx_power = torch.sum(rx_power_matrix, dim=2) # Shape: [B, N]
+            interference_power = torch.clamp(total_rx_power - signal_power, min=0.0)
+            
+            # Shannon Capacity
+            sinr = signal_power / (interference_power + noise_power + 1e-12)
             total_rate += torch.sum(torch.log2(1 + sinr), dim=1)
             
         return total_rate
@@ -441,6 +472,7 @@ def train_downstream(model, train_loader, val_loader, warmup_loader, task_config
         t0 = time.time()
         model.train()
         for bx, target_p in warmup_loader:
+            bx, target_p = bx.to(device), target_p.to(device)
             optimizer.zero_grad()
             pred_powers = model(bx)
             loss = mse_criterion(pred_powers, target_p)
@@ -459,7 +491,7 @@ def train_downstream(model, train_loader, val_loader, warmup_loader, task_config
     total_power = 0.0
     total_samples = 0
     with torch.no_grad():
-        for bx, _ in train_loader:
+        for (bx,) in train_loader:
             batch_power = torch.mean(torch.abs(bx)**2).item()
             total_power += batch_power * bx.size(0)
             total_samples += bx.size(0)
@@ -539,10 +571,10 @@ def perform_tsne(model, test_loader, device='cpu'):
             current_samples += bx.size(0)
             if current_samples >= max_samples: break
             
-    X_emb = np.concatenate(features, axis=0)[:max_samples]
+    X_emb = torch.cat(features, dim=0)[:max_samples].cpu().numpy()
     labels = np.concatenate(all_labels, axis=0)[:max_samples]
     
-    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42, init='pca', learning_rate='auto')
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca', learning_rate='auto')
     return tsne.fit_transform(X_emb), labels
 
 # -----------------------------------------------------------------------------

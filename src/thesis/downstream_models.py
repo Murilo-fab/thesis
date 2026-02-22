@@ -258,7 +258,6 @@ def unfreeze_layers(model, fine_tune_layers):
         return
     
     if fine_tune_layers == "full":
-        print(f"Unfreezing ALL layers in {model.__class__.__name__}")
         for param in model.parameters():
             param.requires_grad = True
         return
@@ -266,7 +265,6 @@ def unfreeze_layers(model, fine_tune_layers):
     # Check if requested layers actually exist
     available_layers = [name for name, _ in model.named_parameters()]
     
-    print(f"Unfreezing layers matching: {fine_tune_layers}")
     for layer_req in fine_tune_layers:
         if not any(layer_req in lname for lname in available_layers):
             print(f"Warning: Layer substring '{layer_req}' not found in model.")
