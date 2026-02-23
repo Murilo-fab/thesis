@@ -121,7 +121,7 @@ class DeepMIMOGenerator:
 
         return mask_corr & mask_gain
     
-    def generate_dataset(self, num_samples, num_users, min_corr=0.3, max_corr=0.8, max_gain_ratio=15.0):
+    def generate_dataset(self, num_samples, num_users, min_corr=0.3, max_corr=0.9, max_gain_ratio=20.0):
         """
         Greedily samples groups of compatible users.
         Returns:
