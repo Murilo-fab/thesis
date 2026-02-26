@@ -64,25 +64,43 @@ class BeamPredictionGenerator:
 
     def load_raw_data(self):
         """
-        Loads and filters data. Only keeps users where LoS != -1.
+        Loads and filters data from ALL Base Stations. 
+        Only keeps users where LoS != -1 and concatenates them into a single dataset.
         """
         print(f"Loading Raw Data for {self.params['scenario']}...")
         
-        # 1. Generate Raw Data
+        # 1. Generate Raw Data (returns a list of BS dictionaries)
         deepmimo_data = DeepMIMOv3.generate_data(self.params)
         
-        raw_chs = deepmimo_data[0]['user']['channel']
-        raw_los = deepmimo_data[0]['user']['LoS']
-        raw_loc = deepmimo_data[0]['user']['location'] # (N, 3)
+        all_bs_chs = []
+        all_bs_locs = []
         
-        # 2. Identify Valid Indices (Users active in the scenario)
-        valid_idxs = np.where(raw_los != -1)[0]
+        # Iterate through each Base Station in the data list
+        for bs_idx, bs_entry in enumerate(deepmimo_data):
+            user_data = bs_entry['user']
+            
+            raw_chs = user_data['channel']
+            raw_los = user_data['LoS']
+            raw_loc = user_data['location']
+            
+            # 2. Identify Valid Indices for THIS Base Station
+            valid_idxs = np.where(raw_los != -1)[0]
+            
+            if len(valid_idxs) > 0:
+                all_bs_chs.append(raw_chs[valid_idxs])
+                all_bs_locs.append(raw_loc[valid_idxs])
+            else:
+                print(f"\tBS {bs_idx}: No valid users found.")
+
+        # 3. Concatenate and Store
+        if not all_bs_chs:
+            raise ValueError("No valid users found across any Base Stations.")
+
+        # Stack all collected BS data along the first axis (N_Samples)
+        self.clean_chs = np.concatenate(all_bs_chs, axis=0)
+        self.clean_locs = np.concatenate(all_bs_locs, axis=0)
         
-        # 3. Filter and Store
-        self.clean_chs = raw_chs[valid_idxs]
-        self.clean_locs = raw_loc[valid_idxs]
-        
-        print(f"\tValid Users found: {len(self.clean_chs)}")
+        print(f"\tTotal Valid User-BS links found: {len(self.clean_chs)}")
         return self.clean_chs
 
     def compute_labels_for_beams(self, n_beams: int) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
@@ -298,7 +316,7 @@ def run_beam_selection_task(experiment_configs: list, task_config: TaskConfig):
 
     # Initialize CSVs
     with open(eff_log, 'w', newline='') as f:
-        csv.writer(f).writerow(["Num_Beams", "Train_Ratio", "Train_Samples", "Model_Name", "Final_F1", "Training_Time"])
+        csv.writer(f).writerow(["Num_Beams", "Train_Ratio", "Train_Samples", "Model_Name", "F1_Score", "Training_Time"])
     
     with open(snr_log, 'w', newline='') as f:
         csv.writer(f).writerow(["Num_Beams", "Train_Ratio", "SNR_dB", "Model_Name", "F1_Score"])

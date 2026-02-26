@@ -66,7 +66,7 @@ def get_parameters(scenario: str) -> Dict[str, Any]:
 
     # 3. BS Selection Logic (Scenario Dependent)
     if scenario in ['city_18_denver', 'city_15_indianapolis']:
-        params['active_BS'] = np.array([3])
+        params['active_BS'] = np.array([1, 2, 3])
     else:
         params['active_BS'] = np.array([1])
 
@@ -128,9 +128,9 @@ def clone_scenarios(scenario_name: str, repo_url: str, base_dir: str = ".") -> N
 def create_dataloaders(
     inputs: torch.Tensor, 
     labels: Optional[torch.Tensor] = None, 
-    train_ratio: float = 0.7, 
+    train_ratio: float = 0.6, 
     val_ratio: float = 0.2, 
-    test_ratio: float = 0.1, 
+    test_ratio: float = 0.2, 
     batch_size: int = 32, 
     seed: int = 42
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:

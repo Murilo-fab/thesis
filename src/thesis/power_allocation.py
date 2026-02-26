@@ -79,14 +79,28 @@ class DeepMIMOGenerator:
         """Loads and cleans raw DeepMIMO data."""
         deepmimo_data = DeepMIMOv3.generate_data(self.params)
 
-        # Filter Valid Users (LoS != -1)
-        idxs = np.where(deepmimo_data[0]['user']['LoS'] != -1)[0]
+        all_channels_list = []
+        all_locs_list = []
+
+        # Iterate through all Base Stations in the list
+        for bs_idx in range(len(deepmimo_data)):
+            # Filter Valid Users (LoS != -1) for each BS
+            idxs = np.where(deepmimo_data[bs_idx]['user']['LoS'] != -1)[0]
+            
+            if len(idxs) > 0:
+                cleaned_data = deepmimo_data[bs_idx]['user']['channel'][idxs]
+                cleaned_locs = deepmimo_data[bs_idx]['user']['location'][idxs]
+                
+                all_channels_list.append(cleaned_data)
+                all_locs_list.append(cleaned_locs)
         
-        cleaned_deepmimo_data = deepmimo_data[0]['user']['channel'][idxs]
-        cleaned_deepmimo_locs = deepmimo_data[0]['user']['location'][idxs]
+        # Concatenate data from all BS
+        all_channels_raw = np.concatenate(all_channels_list, axis=0)
+        cleaned_deepmimo_locs = np.concatenate(all_locs_list, axis=0)
         
         # Remove UE antenna dim: (K, 1, Tx, SC) -> (K, Tx, SC)
-        all_channels = cleaned_deepmimo_data.squeeze() * self.scale_factor
+        # Using axis=1 to strictly target the UE antenna dimension
+        all_channels = all_channels_raw.squeeze(axis=1) * self.scale_factor
         num_total_users = all_channels.shape[0]
 
         return all_channels, num_total_users, cleaned_deepmimo_locs

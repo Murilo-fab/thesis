@@ -83,29 +83,50 @@ class DeepMIMOGenerator:
             ValueError: If DeepMIMO generation fails.
         """
         try:
-            print(f"Loading DeepMIMO Scenario: {self.params['scenario']}...")
+            print(f"Loading DeepMIMO v3 Scenario: {self.params['scenario']}...")
+            # DeepMIMOv3 returns a list where each element is a dictionary for one BS
             deepmimo_data = DeepMIMOv3.generate_data(self.params)
 
-            # Extract Raw Data
-            los_labels = deepmimo_data[0]['user']['LoS']
-            
-            # Filter Valid Users (LoS != -1)
-            valid_idxs = np.where(los_labels != -1)[0]
-            
-            raw_chs = deepmimo_data[0]['user']['channel'][valid_idxs]
-            raw_locs = deepmimo_data[0]['user']['location'][valid_idxs]
-            final_labels = los_labels[valid_idxs]
+            list_chs = []
+            list_labels = []
+            list_locs = []
 
-            # Shape Adjustment: (N, 1_Rx, Tx, Sub) -> (N, Tx, Sub)
-            if raw_chs.ndim == 4:
-                raw_chs = raw_chs.squeeze(axis=1)
+            # Iterate through every Base Station (BS) in the simulation
+            for bs_idx, bs_entry in enumerate(deepmimo_data):
+                # Access the user dictionary for this specific BS
+                user_data = bs_entry['user']
+                los_labels = user_data['LoS']
+                
+                # Filter Valid Users (LoS != -1)
+                valid_idxs = np.where(los_labels != -1)[0]
+                
+                if len(valid_idxs) == 0:
+                    continue
 
-            # Conversion to Tensor
-            chs_tensor = torch.tensor(raw_chs, dtype=torch.complex64) * self.scale_factor
-            labels_tensor = torch.tensor(final_labels, dtype=torch.long)
+                # Extract data for valid users
+                raw_chs = user_data['channel'][valid_idxs]
+                raw_locs = user_data['location'][valid_idxs]
+                final_labels = los_labels[valid_idxs]
+
+                # Shape Adjustment: (N, 1_Rx, Tx, Sub) -> (N, Tx, Sub)
+                if raw_chs.ndim == 4 and raw_chs.shape[1] == 1:
+                    raw_chs = np.squeeze(raw_chs, axis=1)
+
+                list_chs.append(raw_chs)
+                list_labels.append(final_labels)
+                list_locs.append(raw_locs)
+
+            # 1. Concatenate all BS data along the sample axis (axis 0)
+            combined_chs = np.concatenate(list_chs, axis=0)
+            combined_labels = np.concatenate(list_labels, axis=0)
+            combined_locs = np.concatenate(list_locs, axis=0)
+
+            # 2. Convert to PyTorch Tensors
+            chs_tensor = torch.from_numpy(combined_chs).to(torch.complex64) * self.scale_factor
+            labels_tensor = torch.from_numpy(combined_labels).to(torch.long)
             
-            print(f"Data Generation Complete. Shape: {chs_tensor.shape}")
-            return chs_tensor, labels_tensor, raw_locs
+            print(f"Total Samples: {chs_tensor.shape[0]}")
+            return chs_tensor, labels_tensor, combined_locs
         
         except Exception as e:
             raise ValueError(f"DeepMIMO Generation Failed: {str(e)}")
@@ -242,7 +263,7 @@ def run_los_nlos_task(experiment_configs: list, task_config: TaskConfig):
 
     # Initialize CSV Headers
     with open(eff_log, 'w', newline='') as f:
-        csv.writer(f).writerow(["Train_Ratio", "Train_Samples", "Model_Name", "Final_F1", "Training_Time"])
+        csv.writer(f).writerow(["Train_Ratio", "Train_Samples", "Model_Name", "F1_Score", "Training_Time"])
     with open(snr_log, 'w', newline='') as f:
         csv.writer(f).writerow(["Train_Ratio", "SNR_dB", "Model_Name", "F1_Score"])
     with open(res_log, 'w', newline='') as f:

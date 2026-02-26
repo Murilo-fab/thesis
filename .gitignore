@@ -45,6 +45,7 @@ venv.bak/
 scenarios/
 dataset/
 data/
+deepmimo_scenarios/
 
 # --- Experiment Results ---
 # Ignore logs and output CSVs
