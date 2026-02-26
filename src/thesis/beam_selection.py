@@ -340,7 +340,7 @@ def run_beam_selection_task(experiment_configs: list, task_config: TaskConfig):
 
         # Save Map
         pd.DataFrame({
-            'x': locs[:, 0], 'y': locs[:, 1], 'z': locs[:, 2], 'beam_index': y_all.numpy()
+            'x': locs[:, 0], 'y': locs[:, 1], 'z': locs[:, 2], 'label': y_all.numpy()
         }).to_csv(os.path.join(results_folder, f"user_map_data_{n_beams}_beams.csv"), index=False)
         
         # --- 3. Model Loop ---
