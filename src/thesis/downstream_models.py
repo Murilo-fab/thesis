@@ -98,11 +98,27 @@ class RegressionHead(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.regressor = nn.Sequential(
-            nn.Linear(input_dim, 256), 
-            nn.ReLU(),                
-            nn.Linear(256, output_dim),
-            nn.Softmax(dim=1) # Enforce Power Budget Constraint
-        )
+        # Block 1: Expansion
+        nn.Linear(input_dim, 512),
+        nn.LayerNorm(512), 
+        nn.GELU(),
+        nn.Dropout(p=0.2),
+
+        # Block 2: Feature Refinement
+        nn.Linear(512, 256),
+        nn.LayerNorm(256),
+        nn.GELU(),
+        nn.Dropout(p=0.2),
+
+        # Block 3: Compression
+        nn.Linear(256, 128),
+        nn.LayerNorm(128),
+        nn.GELU(),
+
+        # Output Layer
+        nn.Linear(128, output_dim),
+        nn.Softmax(dim=1)        # Enforce fractional Power Budget Constraint (sums to 1)
+    )
 
     def forward(self, x):
         x = x.flatten(start_dim=1)

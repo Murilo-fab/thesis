@@ -472,7 +472,7 @@ def train_downstream(model, train_loader, val_loader, warmup_loader, task_config
     # --- Phase 1: Warm-up (Supervised) ---
     # Teaches the model to mimic PGD outputs before switching to Unsupervised Sum-Rate loss
     mse_criterion = nn.MSELoss()
-    warmup_epochs = int(task_config.epochs * 0.2)
+    warmup_epochs = int(task_config.epochs * 0.4)
     total_train_time = 0.0
 
     for epoch in range(warmup_epochs):
@@ -650,7 +650,7 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
 
         # E. Generate Warm-up Labels (Teacher Mode)
         print(f"\tGenerating Warm-up Labels (PGD)...")
-        warmup_dl_subset = get_subset(train_dl, ratio=0.2)
+        warmup_dl_subset = get_subset(train_dl, ratio=0.4)
         X_warmup_list = [batch[0] for batch in warmup_dl_subset]
         X_warmup = torch.cat(X_warmup_list)
         
