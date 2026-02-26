@@ -119,6 +119,28 @@ class RegressionHead(nn.Module):
         nn.Linear(128, output_dim),
         nn.Softmax(dim=1)        # Enforce fractional Power Budget Constraint (sums to 1)
     )
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Forces a stable, mathematically sound initialization across all layers."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Kaiming Normal is optimal for networks using ReLU/GELU
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+                    
+            elif isinstance(m, nn.LayerNorm):
+                # LayerNorm weights should start at 1, biases at 0
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0)
+
+        # The final Linear layer (before Softmax) needs smaller weights.
+        final_linear = self.regressor[-2] 
+        nn.init.xavier_normal_(final_linear.weight)
+        if final_linear.bias is not None:
+            nn.init.constant_(final_linear.bias, 0)
 
     def forward(self, x):
         x = x.flatten(start_dim=1)

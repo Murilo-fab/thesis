@@ -18,6 +18,7 @@ import os
 import csv
 import time
 import copy
+import random
 from datetime import datetime
 
 # --- 2. Third-Party Imports ---
@@ -50,6 +51,21 @@ warnings.filterwarnings('ignore')
 # -----------------------------------------------------------------------------
 # CLASS: DeepMIMO Generator (Power Allocation Variant)
 # -----------------------------------------------------------------------------
+
+def set_deterministic_seed(seed=42):
+    """Locks down all sources of randomness for perfect reproducibility."""
+    # 1. Python & NumPy
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    # 2. PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # If using multi-GPU
+    
+    # 3. Force cuDNN to behave deterministically (slightly slower, but 100% reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 class DeepMIMOGenerator:
     """
@@ -589,6 +605,7 @@ def perform_tsne(model, test_loader, device='cpu'):
 # -----------------------------------------------------------------------------
 
 def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig):
+    set_deterministic_seed(42)
     task_name = task_config.task_name
     device = task_config.device
     print(f"Starting Task: {task_name}")
