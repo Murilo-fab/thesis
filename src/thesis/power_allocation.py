@@ -356,7 +356,7 @@ class BenchmarkSuite:
             
         return total_rate
 
-    def compute_baselines(self, test_loader, ref_power, num_restarts=20, pgd_steps=100):
+    def compute_baselines(self, test_loader, ref_power, num_restarts=5, pgd_steps=50):
         """Runs Equal, ZF, and Optimal (PGD) baselines."""
         noise_floors = {snr: self._calculate_noise_power(ref_power, snr) for snr in self.snr_levels}
         results = {
@@ -655,7 +655,7 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
         ref_power = torch.mean(torch.abs(all_train_x)**2).item()
         print(f"System Ref Power: {ref_power:.6e}")
 
-        # D. Pre-compute Baselines (Optimal, ZF, Equal)
+        # # D. Pre-compute Baselines (Optimal, ZF, Equal)
         print(f"\tPre-computing Baselines...")
         baseline_results = benchmark.compute_baselines(test_dl, ref_power=ref_power)
 
@@ -667,8 +667,7 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
 
         # E. Generate Warm-up Labels (Teacher Mode)
         print(f"\tGenerating Warm-up Labels (PGD)...")
-        warmup_dl_subset = get_subset(train_dl, ratio=0.4)
-        X_warmup_list = [batch[0] for batch in warmup_dl_subset]
+        X_warmup_list = [batch[0] for batch in train_dl]
         X_warmup = torch.cat(X_warmup_list)
         
         # Use PGD to generate "Ground Truth" powers for supervised pre-training

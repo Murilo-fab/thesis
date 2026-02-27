@@ -90,61 +90,129 @@ class ClassificationHead(nn.Module):
         x = x.flatten(start_dim=1)
         return self.classifier(x)
 
+import torch
+import torch.nn as nn
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout)
+        )
+
+    def forward(self, x):
+        # The skip connection helps gradients flow in deep MLPs
+        return x + self.block(x)
+
 class RegressionHead(nn.Module):
-    """
-    Regression Head for Power Allocation.
-    Output is Softmax-normalized to ensure Sum(Power) = 1 constraint.
-    """
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.regressor = nn.Sequential(
-        # Block 1: Expansion
-        nn.Linear(input_dim, 512),
-        nn.LayerNorm(512), 
-        nn.GELU(),
-        nn.Dropout(p=0.2),
+        
+        # Initial projection to expand the latent space
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU()
+        )
 
-        # Block 2: Feature Refinement
-        nn.Linear(512, 256),
-        nn.LayerNorm(256),
-        nn.GELU(),
-        nn.Dropout(p=0.2),
+        # Deep refinement using Residual Blocks
+        self.res_layers = nn.Sequential(
+            ResidualBlock(512),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            ResidualBlock(256),
+            nn.Linear(256, 128),
+            nn.GELU()
+        )
 
-        # Block 3: Compression
-        nn.Linear(256, 128),
-        nn.LayerNorm(128),
-        nn.GELU(),
-
-        # Output Layer
-        nn.Linear(128, output_dim),
-        nn.Softmax(dim=1)        # Enforce fractional Power Budget Constraint (sums to 1)
-    )
+        # Final regression layer
+        self.final_linear = nn.Linear(128, output_dim)
         
         self._initialize_weights()
-    
+
     def _initialize_weights(self):
-        """Forces a stable, mathematically sound initialization across all layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Kaiming Normal is optimal for networks using ReLU/GELU
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-                    
-            elif isinstance(m, nn.LayerNorm):
-                # LayerNorm weights should start at 1, biases at 0
-                nn.init.constant_(m.weight, 1.0)
-                nn.init.constant_(m.bias, 0)
-
-        # The final Linear layer (before Softmax) needs smaller weights.
-        final_linear = self.regressor[-2] 
-        nn.init.xavier_normal_(final_linear.weight)
-        if final_linear.bias is not None:
-            nn.init.constant_(final_linear.bias, 0)
+        
+        # KEY CHANGE: Start the model near the "Equal Power" baseline
+        # Small weights and zero bias force initial outputs to be uniform
+        nn.init.normal_(self.final_linear.weight, mean=0, std=0.001)
+        nn.init.constant_(self.final_linear.bias, 0)
 
     def forward(self, x):
         x = x.flatten(start_dim=1)
-        return self.regressor(x)
+        x = self.input_proj(x)
+        x = self.res_layers(x)
+        logits = self.final_linear(x)
+        
+        # Replace Softmax with Sigmoid + Norm for better multi-user flexibility
+        power_unnormalized = torch.sigmoid(logits)
+        
+        # Power Budget Constraint: Sum of power = 1
+        sum_power = power_unnormalized.sum(dim=1, keepdim=True)
+        return power_unnormalized / (sum_power + 1e-8)
+
+# class RegressionHead(nn.Module):
+#     """
+#     Regression Head for Power Allocation.
+#     Output is Softmax-normalized to ensure Sum(Power) = 1 constraint.
+#     """
+#     def __init__(self, input_dim, output_dim):
+#         super().__init__()
+#         self.regressor = nn.Sequential(
+#         # Block 1: Expansion
+#         nn.Linear(input_dim, 512),
+#         nn.LayerNorm(512), 
+#         nn.GELU(),
+#         nn.Dropout(p=0.2),
+
+#         # Block 2: Feature Refinement
+#         nn.Linear(512, 256),
+#         nn.LayerNorm(256),
+#         nn.GELU(),
+#         nn.Dropout(p=0.2),
+
+#         # Block 3: Compression
+#         nn.Linear(256, 128),
+#         nn.LayerNorm(128),
+#         nn.GELU(),
+
+#         # Output Layer
+#         nn.Linear(128, output_dim),
+#         nn.Softmax(dim=1)        # Enforce fractional Power Budget Constraint (sums to 1)
+#     )
+        
+#         self._initialize_weights()
+    
+#     def _initialize_weights(self):
+#         """Forces a stable, mathematically sound initialization across all layers."""
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear):
+#                 # Kaiming Normal is optimal for networks using ReLU/GELU
+#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+                    
+#             elif isinstance(m, nn.LayerNorm):
+#                 # LayerNorm weights should start at 1, biases at 0
+#                 nn.init.constant_(m.weight, 1.0)
+#                 nn.init.constant_(m.bias, 0)
+
+#         # The final Linear layer (before Softmax) needs smaller weights.
+#         final_linear = self.regressor[-2] 
+#         nn.init.xavier_normal_(final_linear.weight)
+#         if final_linear.bias is not None:
+#             nn.init.constant_(final_linear.bias, 0)
+
+#     def forward(self, x):
+#         x = x.flatten(start_dim=1)
+#         return self.regressor(x)
 
 # =============================================================================
 # PART 2: UNIFIED WRAPPER
