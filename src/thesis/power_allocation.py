@@ -52,21 +52,6 @@ warnings.filterwarnings('ignore')
 # CLASS: DeepMIMO Generator (Power Allocation Variant)
 # -----------------------------------------------------------------------------
 
-def set_deterministic_seed(seed=42):
-    """Locks down all sources of randomness for perfect reproducibility."""
-    # 1. Python & NumPy
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    # 2. PyTorch
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # If using multi-GPU
-    
-    # 3. Force cuDNN to behave deterministically (slightly slower, but 100% reproducible)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 class DeepMIMOGenerator:
     """
     Handles data generation for Power Allocation.
@@ -323,12 +308,19 @@ class BenchmarkSuite:
         # Power budget per subcarrier (Assuming total power budget = 1.0)
         p_budget_per_sc = 1.0 / SC 
 
+        eye = torch.eye(N, dtype=channels.dtype, device=self.device).expand(B, N, N)
+
         for k in range(SC):
             H_k = channels[:, :, :, k] # Shape: [B, N, Tx]
             
             # 1. Compute Pseudo-Inverse: W_zf = H^H (H H^H)^-1
-            # torch.linalg.pinv handles this directly
-            W_k = torch.linalg.pinv(H_k) # Shape: [B, Tx, N]
+            Gram = torch.matmul(H_k, H_k.mH)
+
+            Gram_reg = Gram + eye * 1e-9
+
+            X = torch.linalg.solve(Gram_reg, H_k) # Shape: [B, Tx, N]
+
+            W_k = X.mH
             
             # 2. Enforce Total Power Constraint: Tr(W * W^H) = p_budget_per_sc
             # Calculate the current total power of the unnormalized precoder
@@ -425,8 +417,7 @@ class BenchmarkSuite:
                     bx_noisy = apply_awgn(bx_clean, current_noise)
 
                     # 2. Inference
-                    logits = model(bx_noisy)
-                    pred_powers = torch.softmax(logits, dim=1)
+                    pred_powers = model(bx_noisy)
 
                     # 3. Rate Calculation (Real Physics)
                     rates = self._compute_raw_rates_mrt(pred_powers, bx_clean, current_noise)
@@ -455,7 +446,7 @@ class BenchmarkSuite:
             optimizer.zero_grad()
             p_cand = torch.softmax(opt_logits, dim=1)
             rates = self._compute_raw_rates_mrt(p_cand, channels_exp, noise_power)
-            loss = -torch.mean(rates)
+            loss = -torch.sum(rates)
             loss.backward()
             optimizer.step()
             
@@ -477,80 +468,85 @@ class BenchmarkSuite:
 # FUNCTION: Training Loop
 # -----------------------------------------------------------------------------
 
-def train_downstream(model, train_loader, val_loader, warmup_loader, task_config):
-    """Trains the Power Allocation model with a Warm-up phase."""
+def train_downstream(model, train_loader, val_loader, warmup_loader, task_config, global_noise_power):
+    """Trains the Power Allocation model with constant-step scaling and global noise floor."""
     device = task_config.device
     model.to(device)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=task_config.lr)
 
-    # --- Phase 1: Warm-up (Supervised) ---
-    # Teaches the model to mimic PGD outputs before switching to Unsupervised Sum-Rate loss
-    mse_criterion = nn.MSELoss()
-    warmup_epochs = int(task_config.epochs * 0.4)
+    # We define a fixed number of total steps we want the model to take, regardless of data volume.
+    target_total_steps = 5000 
+    steps_per_epoch = len(train_loader)
+    
+    # Calculate how many epochs are needed to hit the exact target steps
+    adjusted_epochs = max(10, target_total_steps // steps_per_epoch)
+    
+    warmup_epochs = int(adjusted_epochs * 0.6)
+    self_supervised_epochs = adjusted_epochs - warmup_epochs
+    
     total_train_time = 0.0
 
+    # --- Phase 1: Warm-up (Supervised) ---
+    mse_criterion = nn.MSELoss()
+    
     for epoch in range(warmup_epochs):
         t0 = time.time()
         model.train()
+
         for bx, target_p in warmup_loader:
             bx, target_p = bx.to(device), target_p.to(device)
+
             optimizer.zero_grad()
-            pred_powers = model(bx)
+            
+            # Model already outputs valid probabilities due to built-in Softmax
+            pred_powers = model(bx) 
+            
             loss = mse_criterion(pred_powers, target_p)
             loss.backward()
+            
+            # Prevent early gradient spikes during warm-up
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         
         if device == 'cuda': torch.cuda.synchronize()
         total_train_time += (time.time() - t0)
 
     # --- Phase 2: Self-Supervised (Sum-Rate Max) ---
-    # Re-init optimizer
-    optimizer = optim.Adam(trainable_params, lr=task_config.lr)
+    # Lower LR slightly to avoid gradient shock when switching loss landscapes
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = task_config.lr * 0.2
     
-    # Calculate Training Noise Floor for Loss Function
-    # We use a fixed target SNR (e.g., 5dB) to stabilize gradients during training
-    total_power = 0.0
-    total_samples = 0
-    with torch.no_grad():
-        for (bx,) in train_loader:
-            batch_power = torch.mean(torch.abs(bx)**2).item()
-            total_power += batch_power * bx.size(0)
-            total_samples += bx.size(0)
+    criterion = SumRateLoss(noise_power=global_noise_power)
     
-    train_signal_avg = total_power / total_samples
-    target_train_snr = 10 ** (5.0 / 10.0) 
-    train_noise_power = train_signal_avg / target_train_snr
-    
-    criterion = SumRateLoss(train_noise_power)
-    
-    # Schedulers & Tracking
-    self_supervised_epochs = task_config.epochs - warmup_epochs
-    scheduler = MultiStepLR(optimizer, milestones=[int(0.3*self_supervised_epochs), int(0.7*task_config.epochs)], gamma=0.1)
+    scheduler = MultiStepLR(optimizer, milestones=[int(0.3*self_supervised_epochs), int(0.7*self_supervised_epochs)], gamma=0.1)
     
     history = {'train_loss': [], 'val_rate': []}
     best_val_rate = -float('inf')
     best_model_state = copy.deepcopy(model.state_dict())
 
     for epoch in range(self_supervised_epochs):
-        # Train
         t0 = time.time()
         model.train()
         epoch_loss = 0.0
         
         for (bx,) in train_loader:
             bx = bx.to(device)
+
             optimizer.zero_grad()
             pred_powers = model(bx)
+            
+            # SumRateLoss requires the raw channel to calculate physical interference
             loss = criterion(pred_powers, bx)
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
 
         if device == 'cuda': torch.cuda.synchronize()
         total_train_time += (time.time() - t0)
-        
         scheduler.step()
         history['train_loss'].append(epoch_loss / len(train_loader))
 
@@ -562,17 +558,18 @@ def train_downstream(model, train_loader, val_loader, warmup_loader, task_config
                 bx = bx.to(device)
                 pred_powers = model(bx)
                 loss = criterion(pred_powers, bx)
-                val_rate_sum += (-loss.item()) # Negate loss to get rate
+                val_rate_sum += (-loss.item())
 
         avg_val_rate = val_rate_sum / len(val_loader)
         history['val_rate'].append(avg_val_rate)
 
+        # Early Stopping Checkpointing based strictly on Validation Sum-Rate
         if avg_val_rate > best_val_rate:
             best_val_rate = avg_val_rate
             best_model_state = copy.deepcopy(model.state_dict())
 
     model.load_state_dict(best_model_state)
-    return avg_val_rate, model, history, total_train_time
+    return best_val_rate, model, history, total_train_time
 
 def perform_tsne(model, test_loader, device='cpu'):
     """Extracts features and performs t-SNE visualization."""
@@ -605,7 +602,6 @@ def perform_tsne(model, test_loader, device='cpu'):
 # -----------------------------------------------------------------------------
 
 def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig):
-    set_deterministic_seed(42)
     task_name = task_config.task_name
     device = task_config.device
     print(f"Starting Task: {task_name}")
@@ -633,7 +629,7 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
     generator = DeepMIMOGenerator(task_config.scenario_name)
     benchmark = BenchmarkSuite(task_config.snr_range, device)
     
-    total_samples = 3000
+    total_samples = 2500
     tsne_results = []
 
     # --- 3. Complexity Loop (Number of Users) ---
@@ -654,8 +650,13 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
         all_train_x = train_dl.dataset.tensors[0]
         ref_power = torch.mean(torch.abs(all_train_x)**2).item()
         print(f"System Ref Power: {ref_power:.6e}")
+        
+        # Calculate Global Noise Power once for the entire user complexity loop
+        # Used fixed 5.0 dB SNR for training loss stability as originally intended
+        target_train_snr_linear = 10 ** (5.0 / 10.0) 
+        global_noise_power = ref_power / target_train_snr_linear
 
-        # # D. Pre-compute Baselines (Optimal, ZF, Equal)
+        # D. Pre-compute Baselines (Optimal, ZF, Equal)
         print(f"\tPre-computing Baselines...")
         baseline_results = benchmark.compute_baselines(test_dl, ref_power=ref_power)
 
@@ -665,15 +666,24 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
                 csv.writer(f).writerow([num_users, "N/A", snr, "Zero-Forcing", baseline_results["ZF"][i]])
                 csv.writer(f).writerow([num_users, "N/A", snr, "Equal-Power", baseline_results["Equal"][i]])
 
-        # E. Generate Warm-up Labels (Teacher Mode)
+        # E. Generate Warm-up Labels (Teacher Mode) - BATCHED to prevent OOM
         print(f"\tGenerating Warm-up Labels (PGD)...")
         X_warmup_list = [batch[0] for batch in train_dl]
         X_warmup = torch.cat(X_warmup_list)
         
-        # Use PGD to generate "Ground Truth" powers for supervised pre-training
-        Y_warmup = benchmark.run_optimization_solver(
-            X_warmup.to(device), steps=50, num_restarts=10, return_powers=True
-        ).cpu()
+        Y_warmup_list = []
+        pgd_batch_size = 128 # Safe batch size to prevent CUDA OOM
+        
+        for i in tqdm(range(0, len(X_warmup), pgd_batch_size), desc="PGD Warmup"):
+            batch_x = X_warmup[i:i+pgd_batch_size].to(device)
+            # Use the global noise power to ensure PGD matches the Phase 2 Loss physics exactly
+            batch_y = benchmark.run_optimization_solver(
+                batch_x, steps=50, num_restarts=10, 
+                noise_power=global_noise_power, return_powers=True
+            ).cpu()
+            Y_warmup_list.append(batch_y)
+            
+        Y_warmup = torch.cat(Y_warmup_list, dim=0)
         
         warmup_ds = TensorDataset(X_warmup, Y_warmup)
         warmup_dl = DataLoader(warmup_ds, batch_size=32, shuffle=True)
@@ -684,9 +694,9 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
             original_input_size = config.input_size
             
             # Adjust config for Multi-User
-            config.input_size = original_input_size * num_users
+            config.input_size = original_input_size # * num_users
             config.output_size = num_users
-            print(f"Training model: {name}")
+            print(f"\nTraining model: {name}")
 
             # --- 5. Data Efficiency Loop ---
             for ratio in task_config.train_ratios:
@@ -696,7 +706,10 @@ def run_power_allocation_task(experiment_configs: list, task_config: TaskConfig)
 
                 # Train
                 model = build_model_from_config(config)
-                sum_rate, model, _, t_train = train_downstream(model, frac_train_dl, val_dl, frac_warmup_dl, task_config)
+                # Pass global_noise_power into the training loop
+                sum_rate, model, _, t_train = train_downstream(
+                    model, frac_train_dl, val_dl, frac_warmup_dl, task_config, global_noise_power
+                )
 
                 # Log
                 with open(eff_log, 'a', newline='') as f:

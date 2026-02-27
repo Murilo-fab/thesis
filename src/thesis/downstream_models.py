@@ -36,28 +36,6 @@ class SimpleClassificationHead(nn.Module):
     def forward(self, x):
         x = x.flatten(start_dim=1)
         return self.classifier(x)
-    
-class EnhancedClassificationHead(nn.Module):
-    """
-    Classification Head with Logarithmic Preprocessing.
-    
-    Physics Note:
-    Wireless channel features often span orders of magnitude. 
-    Applying log10(abs(x)) converts values to dB-scale, which is easier for MLPs to learn.
-    """
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)
-        )
-
-    def forward(self, x):
-        x = x.flatten(start_dim=1)
-        # Log-scale transformation (dB-like)
-        x = torch.log10(torch.abs(x) + 1e-9)
-        return self.classifier(x)
 
 class ClassificationHead(nn.Module):
     """
@@ -90,129 +68,92 @@ class ClassificationHead(nn.Module):
         x = x.flatten(start_dim=1)
         return self.classifier(x)
 
-import torch
-import torch.nn as nn
-
-class ResidualBlock(nn.Module):
-    def __init__(self, dim, dropout=0.1):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Dropout(p=dropout)
-        )
+class ResBlock1D(nn.Module):
+    """A standard 1D Residual Block."""
+    def __init__(self, channels, kernel_size=3):
+        super(ResBlock1D, self).__init__()
+        # padding="same" ensures the number of users (K) remains constant
+        padding = kernel_size // 2
+        
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.gelu = nn.GELU()
 
     def forward(self, x):
-        # The skip connection helps gradients flow in deep MLPs
-        return x + self.block(x)
-
-class RegressionHead(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
+        residual = x
         
-        # Initial projection to expand the latent space
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.LayerNorm(512),
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.gelu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        # Skip connection: Add the original input before the final activation
+        out += residual
+        out = self.gelu(out)
+        
+        return out
+
+class ResCNNPowerAllocator(nn.Module):
+    def __init__(self, input_dim, hidden_channels=256, num_blocks=4):
+        """
+        Robust Multi-User Power Allocation Model using a Residual CNN.
+        
+        Args:
+            input_dim (int): Dimension of a single user's representation (e.g., AE latent size).
+            hidden_channels (int): Number of feature channels inside the ResNet.
+            num_blocks (int): Number of residual blocks (controls the receptive field).
+        """
+        super(ResCNNPowerAllocator, self).__init__()
+        
+        # 1. Entry Block: Expands the input features to the hidden channel dimension
+        # Kernel size 3 starts mixing interference between adjacent users immediately
+        self.entry_conv = nn.Sequential(
+            nn.Conv1d(in_channels=input_dim, out_channels=hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_channels),
             nn.GELU()
         )
-
-        # Deep refinement using Residual Blocks
-        self.res_layers = nn.Sequential(
-            ResidualBlock(512),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            ResidualBlock(256),
-            nn.Linear(256, 128),
-            nn.GELU()
+        
+        # 2. Residual Backbone: Deep feature extraction
+        self.res_blocks = nn.Sequential(
+            *[ResBlock1D(hidden_channels) for _ in range(num_blocks)]
         )
-
-        # Final regression layer
-        self.final_linear = nn.Linear(128, output_dim)
         
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-        # KEY CHANGE: Start the model near the "Equal Power" baseline
-        # Small weights and zero bias force initial outputs to be uniform
-        nn.init.normal_(self.final_linear.weight, mean=0, std=0.001)
-        nn.init.constant_(self.final_linear.bias, 0)
+        # 3. Power Prediction Head: Pointwise convolution (kernel=1) to map 
+        # the high-dimensional features down to exactly 1 power logit per user
+        self.exit_conv = nn.Conv1d(in_channels=hidden_channels, out_channels=1, kernel_size=1)
 
     def forward(self, x):
-        x = x.flatten(start_dim=1)
-        x = self.input_proj(x)
-        x = self.res_layers(x)
-        logits = self.final_linear(x)
+        """
+        Args:
+            x (torch.Tensor): Tensor of shape (Batch_Size, K_Users, Input_Dim)
+            
+        Returns:
+            torch.Tensor: Normalized power allocation coefficients of shape (Batch_Size, K_Users)
+        """
+        # Step 1: Reshape for 1D Convolutions
+        # PyTorch Conv1d expects (Batch, Channels, Length)
+        # Here, Length = K_Users, and Channels = Input_Dim
+        x = x.flatten(start_dim=2)
+        x = x.transpose(1, 2)  # Shape becomes: (Batch, Input_Dim, K)
         
-        # Replace Softmax with Sigmoid + Norm for better multi-user flexibility
-        power_unnormalized = torch.sigmoid(logits)
+        # Step 2: Extract features and build the interference map
+        x = self.entry_conv(x) # Shape: (Batch, Hidden_Channels, K)
+        x = self.res_blocks(x) # Shape: (Batch, Hidden_Channels, K)
         
-        # Power Budget Constraint: Sum of power = 1
-        sum_power = power_unnormalized.sum(dim=1, keepdim=True)
-        return power_unnormalized / (sum_power + 1e-8)
-
-# class RegressionHead(nn.Module):
-#     """
-#     Regression Head for Power Allocation.
-#     Output is Softmax-normalized to ensure Sum(Power) = 1 constraint.
-#     """
-#     def __init__(self, input_dim, output_dim):
-#         super().__init__()
-#         self.regressor = nn.Sequential(
-#         # Block 1: Expansion
-#         nn.Linear(input_dim, 512),
-#         nn.LayerNorm(512), 
-#         nn.GELU(),
-#         nn.Dropout(p=0.2),
-
-#         # Block 2: Feature Refinement
-#         nn.Linear(512, 256),
-#         nn.LayerNorm(256),
-#         nn.GELU(),
-#         nn.Dropout(p=0.2),
-
-#         # Block 3: Compression
-#         nn.Linear(256, 128),
-#         nn.LayerNorm(128),
-#         nn.GELU(),
-
-#         # Output Layer
-#         nn.Linear(128, output_dim),
-#         nn.Softmax(dim=1)        # Enforce fractional Power Budget Constraint (sums to 1)
-#     )
+        # Step 3: Predict raw power logits
+        logits = self.exit_conv(x) # Shape: (Batch, 1, K)
         
-#         self._initialize_weights()
-    
-#     def _initialize_weights(self):
-#         """Forces a stable, mathematically sound initialization across all layers."""
-#         for m in self.modules():
-#             if isinstance(m, nn.Linear):
-#                 # Kaiming Normal is optimal for networks using ReLU/GELU
-#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-#                 if m.bias is not None:
-#                     nn.init.constant_(m.bias, 0)
-                    
-#             elif isinstance(m, nn.LayerNorm):
-#                 # LayerNorm weights should start at 1, biases at 0
-#                 nn.init.constant_(m.weight, 1.0)
-#                 nn.init.constant_(m.bias, 0)
-
-#         # The final Linear layer (before Softmax) needs smaller weights.
-#         final_linear = self.regressor[-2] 
-#         nn.init.xavier_normal_(final_linear.weight)
-#         if final_linear.bias is not None:
-#             nn.init.constant_(final_linear.bias, 0)
-
-#     def forward(self, x):
-#         x = x.flatten(start_dim=1)
-#         return self.regressor(x)
+        # Remove the channel dimension
+        logits = logits.squeeze(1) # Shape: (Batch, K)
+        
+        # Step 4: Enforce Physical Power Constraint via Softmax
+        power_allocation = F.softmax(logits, dim=-1)
+        
+        return power_allocation
 
 # =============================================================================
 # PART 2: UNIFIED WRAPPER
@@ -321,8 +262,7 @@ def build_model_from_config(config):
     head_map = {
         "simple_classification": SimpleClassificationHead,
         "classification": ClassificationHead,
-        "enhanced_classification": EnhancedClassificationHead,
-        "regression": RegressionHead,
+        "regression": ResCNNPowerAllocator,
     }
     
     if config.task_type not in head_map:
