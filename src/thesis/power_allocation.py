@@ -372,18 +372,18 @@ class BenchmarkSuite:
                 
                 # We do not use no_grad here because PGD optimization needs gradients
                 # However, for ZF and Eq, we can detach or just compute.
-                
+                bx_noisy = apply_awgn(bx, current_noise)
                 # 1. Equal
-                r_eq = self._compute_raw_rates_mrt(p_eq, bx, current_noise)
+                r_eq = self._compute_raw_rates_mrt(p_eq, bx_noisy, current_noise)
                 results["Equal"][snr] += torch.sum(r_eq).item()
                 
                 # 2. ZF
-                r_zf = self._compute_zf_rates(bx, current_noise)
+                r_zf = self._compute_zf_rates(bx_noisy, current_noise)
                 results["ZF"][snr] += torch.sum(r_zf).item()
                 
                 # 3. Optimal (PGD)
                 r_opt = self.run_optimization_solver(
-                    bx, steps=pgd_steps, num_restarts=num_restarts,
+                    bx_noisy, steps=pgd_steps, num_restarts=num_restarts,
                     noise_power=current_noise, return_powers=False
                 )
                 results["Optimal"][snr] += torch.sum(r_opt).item()
