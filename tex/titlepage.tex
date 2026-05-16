@@ -1,0 +1,150 @@
+% !TEX root = thesis.tex
+%******************************************************************************
+% Some definitions
+%******************************************************************************
+
+% Command for generating a specific amount of whitespace
+\newlength{\drop} 
+\drop=0.05\textheight % Define the command as 10% of the total text height
+
+% Format of emphasized title line
+\def\emphtitleline{\huge\color{MidnightBlue}}
+\def\nonemphtitleline{\large}
+
+% Two lines at top and bottom of page
+\def\twolinestop{ %
+\rule{\textwidth}{1pt}\par % Thick horizontal line
+\vspace{2pt}\vspace{-\baselineskip} % Whitespace between lines
+\rule{\textwidth}{0.4pt}\par % Thin horizontal line
+}
+\def\twolinesbottom{ %
+\rule{\textwidth}{0.4pt}\par % Thick horizontal line
+\vspace{2pt}\vspace{-\baselineskip} % Whitespace between lines
+\rule{\textwidth}{1pt}\par % Thin horizontal line
+}
+
+% The font of the title
+% Standard serif
+\ifdefined\titlefontStandardSerif
+\def\titlefont{\normalfont} 
+\fi
+% Standard san serif
+\ifdefined\titlefontStandardSanSerif
+\def\titlefont{\sffamily} 
+\fi
+% Special serif font. Name: Pacioli
+\ifdefined\titlefontSpecial
+\def\titlefont{\usefont{\encodingdefault}{cpc}{m}{n}\selectfont} 
+\fi
+
+%******************************************************************************
+% The real title page
+%******************************************************************************
+
+\begin{titlepage}
+\vspace*{-30mm}
+\begin{flushright}
+\includegraphics{figures/rwth_inda_en_cmyk}
+\end{flushright}
+
+\centering
+\twolinestop
+\vspace{0.3\drop} % Whitespace between the top lines and title
+
+\begin{raggedleft}
+
+{  \titlefont\renewcommand{\baselinestretch}{1.40}\normalsize
+{\nonemphtitleline \MakeUppercase{\titlelineA}} \\[0.25\baselineskip]
+{\emphtitleline \MakeUppercase{\titlelineB}} \\
+{\nonemphtitleline \MakeUppercase{\titlelineC}} \\[0.25\baselineskip] 
+{\emphtitleline \MakeUppercase{\titlelineD}} \\
+
+
+}
+
+\vspace{0.15\drop} % Whitespace between the title and short horizontal line
+\rule{0.5\textwidth}{0.4pt}\par % Short horizontal line under the title
+\vspace{0.1\drop} % Whitespace between the thin horizontal line and the author name
+
+\makeatletter
+{\Large \textsc{\@author}}\par % Author name
+\makeatother
+
+\end{raggedleft}
+
+\vfill % Whitespace between the author name and publisher text
+\vspace*{20mm}
+%\includegraphics{figures/Ti_black}\\[0.5\baselineskip] % Include a department/university logo
+{\large \textsc{Chair of Information Theory and Data Analytics
+ }}\\[0.5\baselineskip] % Institute
+{\large \textsc{RWTH Aachen University}}\par % Uni
+%
+%\vspace*{0.2\drop} % Whitespace 
+%
+\twolinesbottom
+\end{titlepage}
+%
+\cleardoublepage
+
+%******************************************************************************
+% A second title page containing more information
+%******************************************************************************
+
+\thispagestyle{empty}
+\begingroup
+\vspace*{-30mm}
+\begin{flushright}
+\includegraphics{figures/rwth_inda_en_cmyk}
+\end{flushright}
+\centering
+\twolinestop
+
+\vspace{0.3\drop} % Whitespace between the top lines and title
+
+\begin{raggedleft}
+
+{ \titlefont
+
+\renewcommand{\baselinestretch}{1.40}\normalsize
+{\nonemphtitleline \MakeUppercase{\titlelineA}} \\[0.25\baselineskip]
+{\emphtitleline \MakeUppercase{\titlelineB}} \\
+{\nonemphtitleline \MakeUppercase{\titlelineC}} \\[0.25\baselineskip] 
+{\emphtitleline \MakeUppercase{\titlelineD}} \\
+}
+
+\vspace{0.15\drop} % Whitespace between the title and short horizontal line
+\rule{0.3\textwidth}{0.4pt}\par % Short horizontal line under the title
+\vspace{\drop} % Whitespace between the thin horizontal line and the author name
+
+\makeatletter
+{\Large \textsc{\@author}}\par % Author name
+\makeatother
+
+\end{raggedleft}
+
+\vspace{2\drop}
+
+\begin{flushleft}
+A thesis submitted to the \\
+\textsf{Faculty of Electrical Engineering and Information Technology},\\
+\textsf{RWTH Aachen University},\\[0.5\baselineskip]
+reviewed by \textsf{Univ.-Prof. Dr. Ing. Anke Schmeink} and supervised by \textsf{\supervisor}\\[0.5\baselineskip]
+%on \textsf{\today}\\[0.5\baselineskip] %\textsf{\monthword{\month}~\the\year}
+%in partial fulfilment of the requirements for the degree of\\
+%\textsf{\expecteddegree} in\\
+%\textsf{\fieldofstudy}\\
+\end{flushleft}
+
+\vfill % Whitespace between the author name and publisher text
+\vspace*{30mm}
+%\includegraphics{figures/Ti_black}\\[0.5\baselineskip] % Include a department/university logo
+{\large \textsc{Chair of Information Theory and Data Analytics}}\\[0.5\baselineskip] % Institute
+{\large \textsc{RWTH Aachen University}}\par % Uni
+%
+%\vspace*{0.2\drop} % Whitespace 
+%
+\twolinesbottom
+\endgroup
+
+\cleardoublepage
+

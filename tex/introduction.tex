@@ -1,0 +1,35 @@
+% !TEX root = thesis.tex
+
+\chapter{Introduction}\label{sec:intro}
+
+In recent years, foundation models have emerged as a transformative paradigm across multiple disciplines. Initially gaining prominence in Natural Language Processing (NLP), models such as BERT \cite{devlin2018bert} and GPT \cite{gpt3} achieved unprecedented success by leveraging massive datasets and self-supervised learning to create highly adaptable, general-purpose representations. This breakthrough rapidly expanded into Computer Vision \cite{dosovitskiy2020image}, proving that large-scale pre-training could effectively capture complex spatial hierarchies. 
+
+Additionally, the complexity of telecommunication systems is increasing every year and with the evolution of wireless communications towards the sixth generation (6G) \cite{jiang2021road}, AI is becoming ubiquitous in the field. For those reasons, researchers are trying to create a Foundation Model (FM) for the physical layer of wireless communications.
+
+An FM could, theoretically, help to overcome many challenges of 6G:
+
+\begin{itemize}
+    \item Reduces the data requirements for downstream tasks (data efficiency).
+    \item Introduces high pretraining overhead, but theoretically reduces the complexity and computational requirements of downstream applications.
+    \item Improves robustness to out-of-distribution data.
+\end{itemize}
+
+One of the first implementations of an FM for telecommunications is the Large Wireless Model (LWM) \cite{alikhani2025lwm}. However, it also brought some research gaps:
+
+\begin{itemize}
+    \item LWM embeddings are 4x larger than standard Channel State Information (CSI).
+    \item There is a lack of evaluation across diverse downstream tasks.
+    \item The true computational costs in practical scenarios remain unknown.
+\end{itemize}
+
+For those reasons, during this work, we aim to:
+
+\begin{itemize}
+    \item Compare LWM against lower-dimensional representations, such as an Autoencoder.
+    \item Evaluate data efficiency, noise robustness, and computational complexity.
+    \item Evaluate models in a resource allocation task.
+\end{itemize}
+
+Finally, when necessary and possible, we will explore the effect of fine-tuning the LWM to achieve better performance and explain results through latent space analysis.
+
+This thesis will be divided into the theoretical foundation behind the Large Wireless Model and the implemented autoencoder, related works used during the process, the structure of the downstream tasks used for evaluation, the experimental results and a conclusion and future work chapter.

@@ -1,0 +1,52 @@
+\chapter*{Notation glossary}
+\addcontentsline{toc}{chapter}{Notation glossary}
+\markboth{Notation glossary}{Notation glossary}
+
+{\renewcommand{\arraystretch}{1.5}
+	\begin{longtable}{p{5cm} p{10cm}}
+$n \in \N$ & Natural number \\ 
+$a \in \R$ & Real number, scalar \\ 
+$a \in \Rp$ & Non-negative real number, non-negative scalar \\
+$\vec{a}\in \R^{n}$ &  Real vector of size $n$ \\
+$\mat{a}\in \R^{n\times m}$ &  Real matrix of size $n\times m$ \\
+$\allsubsets{\R^{n}}$ & Set with all subsets of $\R^{n}$ as elements \\
+$\coloneqq$ & Is defined as \\
+$\vecidx{a}{i}, \vecidxB{\vec{a}}{i}$ & $i$th element in vector $\vec{a}$ \\
+$\matidx{a}{i}{j}, \matidxB{\mat{a}}{i}{j}$ & Element at $i$th row and $j$th column in matrix $\mat{a}$ \\
+$\matidx{\vec{a}}{i}{:}, \matidxB{\mat{a}}{i}{:}$ & $i$th row in matrix $\mat{a}$ \\
+$\matidx{\vec{a}}{:}{j}, \matidxB{\mat{a}}{:}{j}$ & $j$th column in matrix $\mat{a}$ \\
+$\vec{b} \coloneqq \vecop (\mat{a}) \in \R^{nm}$ & Vector $\vec{b}$ contains all elements of $\mat{a}$ in row-wise order \\
+$\emptyset$ & Empty set \\
+$\I\subset\N$ & Set of indices \\
+$\card{\I}$ & Cardinality of set $\I$ \\
+%$\I_{\#i}$ & $i$th smallest element of set $\I$ \\
+$\vec{b}\coloneqq\vecidxB{\vec{a}}{\I}\in \R^{\card{\I}}$ & Vector containing elements $\I$ of vector $\vec{a}$ with indices in ascending order\\
+$\matidxB{\mat{a}}{i}{\I} = \vecidxB{\matidx{\vec{a}}{i}{:}}{\I}, 
+ \matidxB{\mat{a}}{\I}{j} = \vecidxB{\matidx{\vec{a}}{:}{j}}{\I} $ & Vector containing elements $\I$ of $i$th row or $j$th column respectively \\
+$\mat{b} \coloneqq \matidxB{\mat{a}}{\I_1}{\I_2} \in \R^{\card{\I_1} \times \card{\I_2}}$ & Matrix containing elements at all combinations of given row and column indices $\I_1$ and $\I_2$ respectively\\
+$\unitvec_{i}$ & Unit vector $i$ \\
+$\identmat_{n}$ & Identity matrix of size $n\times n$ \\
+$\zerovec{n},\ \zeromat{n}{m}$ & Zero-vector of size $n$ or zero-matrix of size $n\times m$ \\
+
+$\onevec{n},\ \onemat{n}{m}$ & One-vector of size $n$ or one-matrix of size $n\times m$ \\
+$\mat{A}^{\top}$ & Transposed matrix \\
+$\inv{\mat{A}}$ & Matrix inverse\\
+$\pinv{\mat{A}}$ & Moore-Penrose pseudo-inverse\\
+$\diag(\vec{a})$ & Diagonal matrix with elements of $\vec{a}$ \\
+$\diag(\mat{a})$ & Diagonal matrix with diagonal elements of $\mat{a}$ \\
+$\abs{\cdot}$ & Absolute value \\
+$\norm{\cdot}{2}$ & Euclidean norm \\
+$\norm{\cdot}{F}$ & Frobenius norm \\
+$\norm{\cdot}{0}$ & $l_0$-norm, i.e., number of non-zero elements \\
+$\ppart{x} = \max(x,0)$ &  Positive part of $x$\\
+$\npart{x} = \min(x,0)$ &  Negative part of $x$\\
+$\logicnot a$ & Logical NOT \\
+$a \logicand b$ & Logical AND \\
+$a \logicor b$ & Logical OR \\
+$a \logicxor b$ & Logical XOR \\
+	\end{longtable}
+}
+
+\cleardoublepage
+
+

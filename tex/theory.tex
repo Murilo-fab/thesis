@@ -1,0 +1,295 @@
+% !TEX root = thesis.tex
+\chapter{Theoretical foundations}\label{sec:theoretical_foundations}
+
+In this work, we consider a massive multiple-input multiple-output (MIMO) system \cite{marzetta2010noncooperative}, where each Base Station (BS) is equipped with $M$ antennas that operate with $N$ subcarriers in orthogonal frequency-division multiplexing (OFDM).
+Each user equipment (UE) possesses a single antenna. The channel state information (CSI) is represented by the matrix $\mathbf{H} \in \mathbb{C}^{M \times N}$.
+
+The following sections discuss two distinct architectures for extracting CSI features with different objectives. The foundation model, LWM, uses a high-dimensional representation to extract rich features from the channel.
+Alternatively, an autoencoder is designed to compress the channel matrix while retaining the most fundamental details. Both approaches are evaluated in downstream tasks against raw channel data.
+
+\section{Large Wireless Model} \label{sec:lwm}
+
+The Large Wireless Model (LWM) \cite{alikhani2025lwm} is a foundation model for wireless channels inspired by architectures such as BERT (Bidirectional Encoder Representations from Transformers) \cite{devlin2018bert} and Vision Transformers (ViTs) \cite{dosovitskiy2020image}.
+Similar to these architectures, the LWM is a transformer encoder-only architecture that processes all inputs simultaneously to extract features and generate a rich representation.
+It utilizes the patch processing technique popularized by ViTs, combined with masked training. However, unlike text and images, wireless channels are complex-valued, requiring specialized pre-processing since most machine learning frameworks are optimized for real floating-point operations.
+
+\subsection{Patch Generation}\label{sec:patch_generation}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{theory/patch_generation.pdf}
+    \caption{Patch generation process.}
+    \label{fig:patch_generation}
+\end{figure}
+
+During preprocessing, wireless channels are segmented into patches to enable the LWM to capture both local and global features.
+Each channel matrix $\mathbf{H} \in \mathbb{C}^{M \times N}$ generates $P$ patches through the following process:
+
+\begin{enumerate}
+    \item \textbf{Split Real and Imaginary Parts}: The channel matrix is complex. However, most neural network frameworks do not support complex numbers natively. Therefore, the first step is to separate the real and imaginary parts:
+    \begin{subequations}
+    \begin{align}
+        \mathbf{H}_{\text{real}} &= \Re(\mathbf{H}), \\
+        \mathbf{H}_{\text{imag}} &= \Im(\mathbf{H}),
+    \end{align}
+    \end{subequations}
+    where $\mathbf{H}_{\text{real}}, \mathbf{H}_{\text{imag}} \in \mathbb{R}^{M \times N}$.
+
+    \item \textbf{Flatten Each Part}: Both $\mathbf{H}_{\text{real}}$ and $\mathbf{H}_{\text{imag}}$ are flattened into vectors:
+    \begin{subequations}
+        \begin{align}
+            \mathbf{h}_{\text{real}} &= \text{vec} \left( \mathbf{H}_{\text{real}}^\top \right), \\
+            \mathbf{h}_{\text{imag}} &= \text{vec} \left( \mathbf{H}_{\text{imag}}^\top \right).
+        \end{align}
+    \end{subequations}
+    This results in two vectors $\mathbf{h}_{\text{real}}, \mathbf{h}_{\text{imag}} \in \mathbb{R}^{MN}$.
+
+    \item \textbf{Patches}: Divide each vector into $P/2$ patches, meaning every patch has length $L$ with $L=2MN/P$ features. Each patch is created by:
+    \begin{subequations}
+        \begin{align}
+            \mathbf{p}_{i} &= \mathbf{h}_{\text{real}}\big[(i - 1)L + 1 \,:\, iL\big], \quad i \in \{1, \dots, P/2\}, \\
+            \mathbf{p}_{i + P/2} &= \mathbf{h}_{\text{imag}}\big[(i - 1)L + 1 \,:\, iL\big], \quad i \in \{1, \dots, P/2\}.
+        \end{align}
+    \end{subequations}
+
+    \item \textbf{CLS Patch}: An additional patch is prepended to the beginning of the sequence, making the sequence length $S$ equal to $P + 1$.
+\end{enumerate}
+
+This patching design exploits the spatial and frequency relationships in the channel matrix. In OFDM systems, adjacent subcarriers tend to have similar gains. In MIMO systems, signal correlation provides information about the physical positions of different antennas. Through the self-attention mechanism, the model learns intra- and inter-patch relationships.
+
+Additionally, the use of patches reduces computational complexity. In Transformers, the self-attention mechanism computes the correlation between every token. The complexity of this operation is $\mathcal{O}(S^2 \cdot D)$ \cite{vaswani2017}, where $S$ is the sequence length and $D$ is the embedding dimension. By using patches, the sequence length is drastically reduced from $2MN$ (every element as a token) to $P + 1$.
+
+However, this technique reduces fine-grained detail. Two nearby features can end in two different patches, which reduces the notion of continuity. Also, the use of patches adds the necessity of including positional encoding, which incurs computational overhead.
+
+Furthermore, the CLS (Classification) patch acts as a compact representation of the wireless channel. Through iterations across the Transformer layers, the CLS token aggregates information from all other patches. The attention score between the CLS token and each patch represents the relative importance of that patch, highlighting specific information for different downstream tasks.
+
+\subsection{Masked Channel Modeling}\label{sec:masked_channel_modeling}
+
+The LWM is trained on a large dataset of unlabeled wireless channels using self-supervised techniques. The model learns structural relationships in the data using a method called Masked Channel Modeling (MCM).  Inspired by Masked Language Modeling (MLM) used in BERT, it involves masking $p\%$ of the patches before training.
+Of the masked patches:
+
+\begin{itemize}
+    \item 80\% are fully masked to force the model to learn spatial dependencies in the channel.
+    \item 10\% are replaced with random vectors from a noise distribution to push the model to distinguish between valid channel data and anomalies.
+    \item 10\% are left unchanged to stabilize model predictions and help recognize meaningful patterns.
+\end{itemize}
+
+This masking methodology follows the standard approach used in BERT pre-training. To prevent information leakage, the masking is applied to both the real part and its imaginary counterpart. If only one component were masked, the model could use the unmasked counterpart to make an indirect inference.
+
+During training, the high-dimensional embeddings of the masked patches pass through a simple linear layer acting as a decoder, mapping them back to the original patch size. Unlike BERT, which predicts a word from a fixed vocabulary, the LWM performs a regression task. The goal is to minimize the Mean Squared Error (MSE) between the original patch and the reconstruction:
+
+\begin{equation}
+    \mathcal{L}_{\text{MCM}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \left\| \mathbf{W}^{\text{dec}} \mathbf{e}_i^{\text{LWM}} - \mathbf{p}_i \right\|^2,
+\end{equation}
+
+where $\mathcal{M}$ represents the set of masked patches, $\mathbf{e}_i^{\text{LWM}} \in \mathbb{R}^{D}$ is the embedding of the $i$-th masked patch, $\mathbf{W}^{\text{dec}} \in \mathbb{R}^{L \times D}$ is the weight matrix of the linear decoder, and $\mathbf{p}_i$ is the original patch value.
+
+\subsection{Input Embedding}\label{sec:input_embedding}
+
+Before being fed into the Transformer, each patch is projected into an embedding space of dimension $D$ via a linear layer:
+
+\begin{equation}
+    \begin{aligned}
+        \mathbf{e}^{\text{emb}}_{i} &= \mathbf{W}^{\text{emb}} \mathbf{p}_{i} + \mathbf{b}, \\
+        & i \in \{\text{CLS}\} \cup \{1, \dots, P\}, \\
+        & \mathbf{W}^{\text{emb}} \in \mathbb{R}^{D \times L}.
+    \end{aligned}
+\end{equation}
+
+This operation produces initial patch embeddings $\mathbf{E}^{\text{emb}} = [\mathbf{e}^{\text{emb}}_{\text{cls}}, \mathbf{e}^{\text{emb}}_{1}, \dots, \mathbf{e}^{\text{emb}}_{P}]^\top \in \mathbb{R}^{(P+1) \times D}$.
+The dimensionality is increased to enable the Transformer to capture detailed relationships, such as spatial correlation, multipath effects, and scattering.
+
+Since Transformers lack sequence awareness, positional encodings are added. For the CLS token, the positional encoding is a zero vector to avoid spatial bias. For other patches, it is defined as:
+
+\begin{equation}
+    \mathbf{p}^{\text{pos}}_i = i \cdot \mathbf{1}_{L}, \quad i \in \{1, \dots, P\},
+\end{equation}
+
+where $\mathbf{1}_{L}$ is a vector of ones. These are mapped into the embedding space via $\mathbf{W}^{\text{pos}} \in \mathbb{R}^{D \times L}$ and bias $\mathbf{b}^{\text{pos}} \in \mathbb{R}^D$:
+
+\begin{equation}
+    \mathbf{e}^{\text{pos}}_{i} = \mathbf{W}^{\text{pos}} \mathbf{p}^{\text{pos}}_i + \mathbf{b}^{\text{pos}}.
+\end{equation}
+
+Finally, the input embedding for the Transformer is the sum of the patch embedding and the positional encoding:
+
+\begin{equation}
+    \mathbf{e}^{\text{input}}_{i} = \mathbf{e}^{\text{emb}}_{i} + \mathbf{e}^{\text{pos}}_{i}.
+\end{equation}
+
+The final input is represented by the matrix $\mathbf{E}^{\text{input}} \in \mathbb{R}^{(P+1) \times D}$.
+
+\subsection{Architecture}\label{sec:lwm_architecture}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.25\linewidth]{theory/lwm_enconding_block.pdf}
+    \caption{Encoding block.}
+    \label{fig:encoding_block}
+\end{figure}
+
+The architecture follows the standard Transformer encoder design. The model refines the input embedding using a sequence of $E$ encoder blocks. In each block, the input passes through \textbf{multi-head attention}, \textbf{layer normalization} with \textbf{residual connections}, and a \textbf{feed-forward network}.
+
+The self-attention mechanism allows each patch to evaluate the importance of other patches. It is computed via \textbf{scaled dot-product attention} \cite{vaswani2017} :
+
+\begin{equation}
+    \text{Attention}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \text{softmax} \left( \frac{\mathbf{Q} \mathbf{K}^{\top}}{ \sqrt{D_H}} \right) \mathbf{V},
+\end{equation}
+
+where Query ($\mathbf{Q}$), Key ($\mathbf{K}$), and Value ($\mathbf{V}$) are obtained by linear transformations of $\mathbf{E}^{\text{input}}$ using learned weights $\mathbf{W}^{Q}, \mathbf{W}^{K}, \mathbf{W}^{V} \in \mathbb{R}^{D \times D_H}$. $D_H = \lfloor D / H \rfloor$ is the dimension per head.
+
+With $H$ independent attention heads, the model learns features from various subspaces of the channel. The final output is the concatenation of each head passed through a linear projection $\mathbf{W}^{O} \in \mathbb{R}^{H D_H \times D}$:
+
+\begin{equation}
+    \text{MultiHead}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \text{Concat}(\text{head}_1, \dots, \text{head}_H) \mathbf{W}^{O}.
+\end{equation}
+
+Each encoder layer also includes a Feed-Forward Network (FFN) that applies two linear transformations with a ReLU activation in between:
+
+\begin{equation}
+    \text{FFN}(\mathbf{e}_i) = \text{ReLU} \left( \mathbf{e}_i \mathbf{W}_{1} + \mathbf{b}_{1}\right) \mathbf{W}_{2} + \mathbf{b}_{2},
+\end{equation}
+
+where $\mathbf{W}_{1} \in \mathbb{R}^{D \times D_{FF}}$, $\mathbf{W}_{2} \in \mathbb{R}^{D_{FF} \times D}$, and $D_{FF} = T \cdot D$ (with $T$ being an expansion factor).
+
+Finally, layer normalization stabilizes the training \cite{ba2016layer}, and residual connections allow gradients to flow easily.
+
+\section{Autoencoders}\label{sec:autoencoder}
+
+Another prominent trend in wireless communication is the use of autoencoders to compress Channel State Information (CSI). As the size of MIMO systems increases, the dimensions of the channel matrix increase correspondingly. 
+To mitigate the curse of dimensionality, autoencoders are employed to remove noise and redundant information, thereby compressing the matrix $\mathbf{H}$. This technique significantly reduces transmission overhead.
+In a typical system, the User Equipment (UE) transmits the channel matrix to the Base Station (BS).
+By compressing this information into a latent space, bandwidth usage is optimized. If required, $\mathbf{H}$ is reconstructed at the BS.
+
+A primary goal of this work is to demonstrate that the compressed version of the channel in the latent space can be utilized to perform various downstream tasks.
+To demonstrate this, an autoencoder based on the CSINet \cite{wen2018deep} architecture was developed.
+
+\subsection{Input Representation}\label{sec:autoencoder_input}
+
+Unlike the LWM, the proposed autoencoder is a Convolutional Neural Network (CNN). Similar to the LWM, the input is the channel matrix $\mathbf{H} \in \mathbb{C}^{M \times N}$.
+Since standard neural networks operate in the real-valued domain, the input is transformed into a 2-channel tensor $\mathbf{X}_{\text{in}} \in \mathbb{R}^{2 \times M \times N}$, where the first channel contains the real component $\Re(\mathbf{H})$ and the second contains the imaginary component $\Im(\mathbf{H})$:
+
+\begin{equation}
+    \mathbf{X}_{\text{in}} = [\Re\{\mathbf{H}\}, \Im\{\mathbf{H}\}].
+\end{equation}
+
+Prior to feature extraction, the input $\mathbf{X}_{\text{in}}$ passes through a batch normalization layer \cite{ioffe2015batch}.
+
+\subsection{Architecture}\label{sec:autoencoder_architecture}
+
+The CNN exploits local correlations in the channel matrix and its approximate sparsity to create a compressed representation.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[height=8cm, keepaspectratio]{theory/csi_encoder.pdf}
+        \caption{Encoder}
+        \label{fig:csi_encoder}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.45\textwidth}
+        \centering
+        \includegraphics[height=8cm, keepaspectratio]{theory/csi_decoder.pdf}
+        \caption{Decoder and Refinement Block}
+        \label{fig:csi_decoder}
+    \end{subfigure}
+
+    \caption{Autoencoder architecture divided into Encoder and Decoder blocks.}
+    \label{fig:autoencoder_architecture}
+\end{figure}
+
+The network is composed of two sub-networks:
+
+\begin{enumerate}
+    \item \textbf{Encoder}: Uses a deep learning module to compress the CSI. It maps the channel matrix $\mathbf{H}$ to a low-dimensional latent vector $\mathbf{z}$. In practical applications, this component resides at the UE.
+    \item \textbf{Decoder}: Reconstructs the original channel $\mathbf{H}$ from the vector $\mathbf{z}$.
+\end{enumerate}
+
+The encoder consists of a sequence of three convolutional blocks with a hierarchical design:
+
+\begin{itemize}
+    \item \textbf{Low-level feature extraction}: The initial block expands the two input channels into $C_1$ feature maps using $K \times K$ kernels. This layer detects local features and correlations between adjacent antennas and subcarriers while preserving the resolution of the channel $M \times N$. This process is followed by batch normalization and a ReLU activation.
+    \item \textbf{Intermediate Feature Processing}: The second block deepens the feature representation by applying a convolutional layer that maintains the number of maps $C_1$ and reduces the resolution by half ($M/2 \times N/2$) using a Max Pooling operation. Batch normalization and ReLU activation are applied between the convolution and pooling layers.
+    \item \textbf{High-level Feature Extraction}: The final block compresses the spatial dimensions while increasing the number of feature maps. A convolutional layer increases the number of maps to $C_2$, followed by max pooling that reduces the resolution to $M/4 \times N/4$. Similar to the previous block, batch normalization followed by ReLU activation is applied.
+\end{itemize}
+
+Finally, the feature maps of the last block are flattened into a vector $\mathbf{v} \in \mathbb{R}^{D_{\text{flat}}}$, where $D_{\text{flat}} = C_2 \cdot (M/4) \cdot (N/4)$. This is projected into a single vector $\mathbf{z} \in \mathbb{R}^{D_{\text{latent}}}$ by a fully connected layer:
+
+\begin{equation}
+    \mathbf{z} = \mathbf{W}^{\text{latent}} \mathbf{v} + \mathbf{b}^{\text{latent}},
+\end{equation}
+
+where $\mathbf{W}^{\text{latent}} \in \mathbb{R}^{D_{\text{latent}} \times D_{\text{flat}}}$ is the weight matrix and $\mathbf{b}^{\text{latent}} \in \mathbb{R}^{D_{\text{latent}}}$ is the bias vector. This latent vector is used to perform downstream tasks. Additionally, the compression ratio $\eta$ is defined as the ratio between the size of the latent dimension and the size of the flattened channel matrix:
+
+\begin{equation}
+    \eta = \frac{D_{\text{latent}}}{2 M N}.
+\end{equation}
+
+The decoder performs the inverse operation to estimate the reconstructed channel $\hat{\mathbf{X}}$.
+However, reconstructing the channel is more complex than compression. Therefore, the decoder utilizes **Refinement Blocks** between upsampling stages.
+
+\begin{itemize}
+    \item \textbf{Feature expansion}: The latent vector is mapped back to the flat dimension $D_{\text{flat}}$ via a linear transformation and reshaped to $C_2$ feature maps with resolution $M/4 \times N/4$.
+    \item \textbf{Upsampling}: Through a transposed convolution followed by batch normalization and ReLU activation, the maps are transformed into $C_1$ feature maps with resolution $M/2 \times N/2$.
+    \item \textbf{Residual refinement}: A series of refinement blocks is used to enhance the reconstruction while maintaining the same resolution and number of maps.
+    \item \textbf{Final reconstruction}: Finally, the refined maps are upsampled back to the original format to generate $\hat{\mathbf{X}} \in \mathbb{R}^{2 \times M \times N}$.
+\end{itemize}
+
+\subsection{Refinement Blocks}\label{sec:autoencoder_refinement_blocks}
+
+To improve the reconstruction quality of the decoder, we incorporate a residual learning stage between upsampling steps. This is particularly important to mitigate the blurring effect caused by upsampling. In these refinement blocks, the decoder maintains the resolution ($H \times W$) and depth ($C$) of the features.
+
+Each refinement block is composed of two stacks of convolution and batch normalization with a non-linear activation between them.
+
+\begin{equation}
+    \mathbf{Y} = \text{ReLU} \left( \mathcal{F} \left( \mathbf{X}_{\text{Ref}} \right) + \mathbf{X}_{\text{Ref}} \right),
+\end{equation}
+
+where $\mathbf{X}_{\text{Ref}} \in \mathbb{R}^{C \times H \times W}$ is the input, and $\mathcal{F} \left( \mathbf{X}_{\text{Ref}} \right)$ represents the mapping learned by the convolutional layers:
+
+\begin{equation}
+    \mathcal{F}(\mathbf{X}) = \text{BN}_2\left( \mathbf{W}_2 * \sigma\left( \text{BN}_1\left( \mathbf{W}_1 * \mathbf{X} \right) \right) \right).
+\end{equation}
+
+Here, $\mathbf{W}_1$ and $\mathbf{W}_2$ represent the $K \times K$ convolution kernels, $*$ denotes the convolution operation, $\text{BN}_1$ and $\text{BN}_2$ are batch normalization layers, and $\sigma$ is the non-linear activation. 
+The residual connection allows gradients to flow through the network and prevents the vanishing gradient problem \cite{he2016deep}.
+
+Experiments demonstrate that two refinement blocks are sufficient to obtain excellent results. The addition of further blocks yields marginal improvements while significantly increasing complexity.
+
+After refinement, the maps are upsampled again to the original resolution $M \times N$ using a transposed convolution layer to create the reconstructed channel $\hat{\mathbf{X}} \in \mathbb{R}^{2 \times M \times N}$. This architecture enables a highly compact representation of the original channel while preserving the most important information. This is possible because antenna arrays that are spatially close exhibit high correlation in amplitude and phase. Similarly, the channel response changes gradually across different subcarriers in OFDM systems. These relationships are captured by the kernels in the convolutional layers.
+
+\subsection{Training}\label{sec:autoencoder_training}
+
+The autoencoder is designed not only for compression but also for robust channel reconstruction under noise conditions. We employ a self-supervised denoising strategy to achieve this.
+This training strategy forces the model to produce a more robust latent representation.
+
+\begin{enumerate}
+    \item Before training, we calculate the average power of the entire training dataset, $P_{\text{ref}}$, to use as a baseline for noise injection.
+    \item For each batch, we uniformly sample an SNR level from a predefined range ($0$ dB to $20$ dB).
+    \item The noise variance is derived using the reference power:
+    \begin{subequations}
+        \begin{align}
+            \sigma^2_{\text{noise}} = \frac{P_{\text{ref}}}{10^{\text{SNR}_{\text{dB}}/10}}.
+        \end{align}
+    \end{subequations}
+    \item Complex-valued noise $\mathbf{N} \sim \mathcal{CN} (0, \sigma^2_{\text{noise}})$ is added to the original channel:
+    \begin{subequations}
+        \begin{align}
+           \tilde{\mathbf{H}} = \mathbf{H} + \mathbf{N}.
+        \end{align}
+    \end{subequations}
+\end{enumerate}
+
+The goal of the training is to minimize the Normalized Mean Squared Error (NMSE) loss:
+
+\begin{equation}
+    \mathcal{L}_{\text{NMSE}} = \frac{1}{B} \sum_{i=1}^{B} \frac{ \| \mathbf{H}^{(i)} - \hat{\mathbf{H}}^{(i)} \|_F^2 }{ \| \mathbf{H}^{(i)} \|_F^2 },
+\end{equation}
+
+where $\mathbf{H}^{(i)}$ is the $i$-th clean channel and $\hat{\mathbf{H}}^{(i)}$ is the $i$-th channel reconstructed from the noisy input.
+The normalized loss was chosen because, in wireless systems, the magnitude of the channel can vary significantly due to path loss.
+Standard MSE could cause the system to prioritize reconstructing stronger users.
+Normalization ensures that all users are treated equally.
+
+Validation is performed at a fixed SNR to provide a stable metric for tracking model performance.
